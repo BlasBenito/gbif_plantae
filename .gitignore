@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+data/
+logs/
+postgresql.jar
+postgresql-42.2.16.jar
+ecoregions.sql
