@@ -1,5 +1,5 @@
 ---
-title: "*Plantae* database"
+title: "Data preparation"
 output: html_notebook
 ---
 
@@ -61,7 +61,15 @@ list.of.packages <- c(
   "dtplyr", 
   "dbplyr", 
   "RPostgreSQL",
-  "readr"
+  "rpostgis",
+  "readr",
+  "sp",
+  "raster",
+  "tidyverse",
+  "hypervolume",
+  "landscapemetrics",
+  "rgbif",
+  "tibble"
   )
 
 new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
@@ -76,7 +84,21 @@ library(dtplyr)
 library(dbplyr)
 library(data.table)
 library(RPostgreSQL)
+library(rpostgis)
 library(readr)
+library(sp)
+library(raster)
+library(tidyverse)
+library(hypervolume)
+library(landscapemetrics)
+library(rgbif)
+library(tibble)
+
+#loading functions
+source("functions.R")
+
+#removing scientific notation
+options(scipen = 9999)
 ```
 
 The package `sparklyr` is an `R` interface to [Apache Spark](https://spark.apache.org/). Spark is an engine for large-data processing, and allows `R` to work with files larger than the RAM memory of a computer. It does so by separating a dataset into pieces (chunks) that are written into the hard disk. Data processing in Spark is done in parallel, and each data chunk is managed independently by a *worker*. Spark datasets are named DataFrames, but they have nothing to do with the traditional data frames used by `R`. However, Spark DataFrames can easily be processed with `dplyr` through `sparklyr`. Since Spark DataFrames are stored in the hard disk, data processing operations are still relatively slow, but much faster than in a traditional database. 
@@ -222,7 +244,7 @@ To connect with the local server, create a new connection with the IP 127.0.0.1,
 
 ### Connecting R and PostgreSQL
 
-A good reference on how to do this can be found here [https://db.rstudio.com/dplyr/](https://db.rstudio.com/dplyr/). The packages `dbplyr` and `RPostgreSQL` are required to establish this connection. The function `RPostgreSQL::dbConnect()` does the job.
+A good reference on how to do this can be found here [https://db.rstudio.com/dplyr/](https://db.rstudio.com/dplyr/). The packages `dbplyr` and `RPostgreSQL` are required to establish this connection. The function `RPostgreSQL:: dbConnect()` does the job.
 
 ```{r}
 postgresql.connection <- RPostgreSQL::dbConnect(
@@ -238,6 +260,82 @@ We can list the tables available with  `RPostgreSQL::dbListTables()`.
 
 ```{r, eval = FALSE}
 RPostgreSQL::dbListTables(postgresql.connection)
+```
+
+This will be a relatively large database, and several performance improvements can be achieved to make computations more efficient. The parameters of PostgreSQL can be consulted at [https://postgresqlco.nf/en/doc/param/](https://postgresqlco.nf/en/doc/param/). The current server settings are stored in `pg_settings`.
+
+```{sql connection=postgresql.connection}
+SELECT * FROM pg_settings;
+```
+
+The most relevant ones are described and changed below.
+
+**shared_buffers**
+
+The RAM memory buffers used by the server should be around 40% of the total memory of the computer for maximum performance (the default is 128MB). Changing this parameter requires restarting the database. 
+
+To find the current value:
+
+```{sql connection=postgresql.connection}
+SHOW shared_buffers;
+```
+
+To change it:
+
+```{sql connection=postgresql.connection}
+ALTER SYSTEM SET shared_buffers TO '12.8GB';
+```
+
+The server needs to be restarted from the system console
+
+```{bash}
+sudo systemctl restart postgresql
+```
+
+Checking that the change took place.
+
+```{sql connection=postgresql.connection}
+SHOW shared_buffers;
+```
+
+**work_mem**
+
+Is the working memory of PostgreSQL before going into swapping. This quantity is set per transaction (not globally!).
+
+```{sql connection=postgresql.connection}
+SHOW work_mem;
+```
+
+To set it for a given transaction, use `SET LOCAL`. It will reset the value of `work_mem` once the transaction is done. To found what number to use first execute `EXPLAIN` (estimates cost of a query without running it) or `EXPLAIN ANALYZE` (computes cost of a query after running it) on the query until `..external merge Disk...` does not appear any longer.
+
+```{sql connection=postgresql.connection}
+EXPLAIN SELECT * FROM plantae LIMIT 100;
+SET LOCAL work_mem = '500MB';
+SELECT * FROM plantae LIMIT 100;
+```
+
+
+**maintenance_work_mem**
+
+As above, but only for maintenance tasks such as `ANALYZE`, `VACUUM`, `CREATE`, `INDEX`, and `REINDEX`. It can be set per session.
+
+```{sql connection=postgresql.connection}
+SET maintenance_work_mem TO '4GB';
+```
+
+To reset it to its default value.
+
+```{sql connection=postgresql.connection}
+RESET maintenance_work_mem;
+```
+
+
+**cpu_tuple_cost**
+
+Estimates the cost of processing a row. It defaults to 0.01, but according to [this StackOverflow answer](https://stackoverflow.com/a/13479410), values in the range [0.03, 0.05 should provide better performance.
+
+```{sql connection=postgresql.connection}
+ALTER SYSTEM SET cpu_tuple_cost TO '0.03';
 ```
 
 ## Data processing with Spark
@@ -377,7 +475,7 @@ sparklyr::spark_write_jdbc(
 )
 ```
 
-To check the size of the database once the table has been written into PostgreSQL you can use the following SQL clause, that gives the size in MB. 
+To check the size of the database once the table has been written into PostgreSQL, the following SQL clause, that gives the size in MB, can be used. 
 
 ```{sql connection=postgresql.connection, eval = TRUE}
 select pg_database_size('flora_ecoregions')/1024/1024;
@@ -389,25 +487,6 @@ Alternatively, the psql console can be used, as follows.
 sudo -u postgres psql
 \l+ flora_ecoregions
 ```
-
-
-To read the table back to Spark [CRASHED MY SESSION...]
-
-```{r, eval = FALSE}
-plantae <- sparklyr::spark_read_jdbc(
-  sc = spark.connection,
-  name = "plantae",
-  options = list(
-    url = "jdbc:postgresql://localhost:5432/flora_ecoregions",
-    user = "postgres",
-    password = rstudioapi::askForPassword("Database password"),
-    driver = "org.postgresql.Driver",
-    dbtable = "plantae"
-  )
-)
-```
-
-
 
 The connection with Spark can be closed now.
 
@@ -443,21 +522,89 @@ DROP DATABASE flora_ecoregions
 The table needs to have a unique identifier for each row, and an index in such column
 
 ```{sql connection=postgresql.connection, eval = TRUE}
+-- adding id column and creating index
 ALTER TABLE plantae ADD COLUMN id bigserial PRIMARY KEY;
 CREATE INDEX plantae_id_index ON plantae (id);
 ```
 
-There are records with null values in the latitude and longitude column
-
 ### geom column from latitude and longitude
 
 ```{sql connection=postgresql.connection}
--- Adding geometry column and geom field
+-- adding geometry column and geom field
 SELECT AddGeometryColumn ('plantae','geom',4326,'POINT',2);
 UPDATE plantae SET geom = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326);
 
--- Generating spatial index  
+-- generating spatial index  
 CREATE INDEX plantae_geom_index ON plantae USING GIST (geom);
+
+-- clustering the data in the hard disk by the index (performance improvement)
+CLUSTER plantae USING plantae_geom_index;
+```
+
+## Preparing table of unique species
+
+In this section I prepare a table with the unique species found in `plantae`. The objective of this table is to store data about the taxonomy, rarity, and traits of the species used in the analysis.
+
+```{sql connection=postgresql.connection}
+-- generating table with unique species
+CREATE TABLE species AS
+FROM plantae
+SELECT
+DISTINCT
+kingdom,
+phylum,
+class,
+family,
+genus,
+species
+ORDER BY 
+phylum,
+class,
+family,
+genus,
+species;
+
+-- adding ID
+ALTER TABLE species ADD COLUMN species_id bigserial PRIMARY KEY;
+CREATE INDEX species_id_index ON species (species_id);
+
+-- add column to store number of spatial records
+ALTER TABLE species ADD COLUMN spatial_records integer;
+
+-- counting spatial records of each species in plantae
+WITH sq AS (
+SELECT 
+plantae.species,
+COUNT(*) as spatial_records
+FROM plantae 
+GROUP BY species
+)
+UPDATE species
+SET spatial_records = sq.spatial_records
+FROM sq
+WHERE species.species = sq.species;
+
+-- add column to store geographic features
+SELECT AddGeometryColumn ('species','geom',4326,'MULTIPOINT',2);
+
+-- gathering the points of each species into a geom
+WITH sq AS (
+SELECT
+ST_Collect(plantae.geom) as geom,
+species
+FROM plantae
+GROUP BY species
+)
+UPDATE species
+SET geom = sq.geom
+FROM sq
+WHERE species.species = sq.species;
+
+-- spatial index on the geom column
+CREATE INDEX species_geom_index ON species USING GIST (geom);
+
+-- clustering the data in the hard disk by the index (performance improvement)
+CLUSTER species USING species_geom_index;`
 ```
 
 
@@ -466,7 +613,7 @@ CREATE INDEX plantae_geom_index ON plantae USING GIST (geom);
 The world's ecoregions are the working units of this project. To import `wwf_terr_ecos.shp` into the `flora_ecoregions`, we first convert the shp into sql with `shp2pgsql`, which comes installed with PostGIS.
 
 ```{bash, echo = FALSE}
-shp2pgsql -s 4326 -I /home/blas/Dropbox/RESEARCH/DATA/Global_bio_ecoregions_Dinerstein_2017/Ecoregions2017.shp ecoregions > ecoregions.sql
+shp2pgsql -s 4326 -I /home/blas/Dropbox/RESEARCH/DATA/Global_bio_ecoregions_Dinerstein_2017/Ecoregions2017_fixed_geometry.shp ecoregions > /home/blas/Dropbox/RESEARCH/DATA/Global_bio_ecoregions_Dinerstein_2017/ecoregions2017.sql
 ```
 
 Now, `ecoregions.sql` must be executed in the PostgreSQL server.
@@ -474,7 +621,7 @@ Now, `ecoregions.sql` must be executed in the PostgreSQL server.
 ```{r}
 RPostgreSQL::dbSendQuery(
   conn = postgresql.connection,
-  statement = readr::read_file('ecoregions.sql')
+  statement = readr::read_file('/home/blas/Dropbox/RESEARCH/DATA/Global_bio_ecoregions_Dinerstein_2017/ecoregions2017.sql')
 )
 ```
 
@@ -484,19 +631,10 @@ We list the tables again to check that one named `ecoregions` exists.
 RPostgreSQL::dbListTables(postgresql.connection)
 ```
 
-
-We can check this table from the R environment to decide what columns we need to remove.
-
-```{r, echo = FALSE}
-ecoregions_db <- RPostgreSQL::dbReadTable(
-  con = postgresql.connection, 
-  name = "ecoregions"
-  )
-```
-
-We can delete the columns directly in the database
+We can delete the columns directly in the database, and rename several other columns.
 
 ```{sql connection=postgresql.connection}
+-- deleting columns
 ALTER TABLE ecoregions
 DROP COLUMN gid,
 DROP COLUMN objectid,
@@ -508,11 +646,8 @@ DROP COLUMN color,
 DROP COLUMN color_bio,
 DROP COLUMN color_nnh,
 DROP COLUMN license;
-```
 
-And rename several columns
-
-```{sql connection=postgresql.connection}
+-- renaming columns
 ALTER TABLE ecoregions RENAME COLUMN eco_name TO ecoregion;
 ALTER TABLE ecoregions RENAME COLUMN biome_name TO biome;
 ALTER TABLE ecoregions RENAME COLUMN shape_leng TO perimeter;
@@ -520,43 +655,2547 @@ ALTER TABLE ecoregions RENAME COLUMN shape_area TO area;
 ALTER TABLE ecoregions RENAME COLUMN nnh_name TO conservation_assessment;
 ```
 
-
-```{r}
-rm(ecoregions_db)
-```
-
-As with the table `plantae`, `ecoregions` needs a unique ID as primary key, an index on this column, and an index in the geom column.
+As the table `plantae`, `ecoregions` needs a unique ID as primary key, an index on this column, and an index in the geom column.
 
 ```{sql connection=postgresql.connection, eval = FALSE}
 ALTER TABLE ecoregions ADD COLUMN id serial PRIMARY KEY;
 CREATE INDEX ecoregions_id_index ON ecoregions (id);
-```
 
-And a spatial index on geom
-
-```{sql connection=postgresql.connection}
 CREATE INDEX ecoregions_geom_index ON ecoregions USING GIST (geom);
 ```
 
+To compute update the `area` field (because I am not sure how it was computed in the first place) in square kilometers:
+
+```{sql connection=postgresql.connection}
+UPDATE ecoregions
+SET area = ST_Area(geom::geography) / 1000000;
+```
+
+I also reduce the complexity of the polygons to speed-up spatial queries with `ST_Simplify`. This function does not work well with latitude and longitude data, hence I transform to src 32701 (UTM Zone 1, but others would work as well) and then back to 4326 (latlong WGS84) with `ST_Transform`.
+
+```{sql connection=postgresql.connection}
+ALTER TABLE ecoregions
+ADD COLUMN geom_simple geometry;
+
+UPDATE ecoregions
+SET geom_simple = ST_Transform(ST_Simplify(ST_Transform(geom, 32701), 10000), 4326);
+
+CREATE INDEX ecoregions_geom_simple_index ON ecoregions USING GIST (geom_simple);
+```
 
 ## Joining ecoregions and presence records
 
-To do the spatial join we use the command `ST_Intersects` of PostGIS to find the ecoregion over which every record of plantae can be found. Instead of updating `plantae`, here I create a new table named `plantae_ecoregions`
+First, the unique coordinates in `plantae` need to be extracted into a new table.
 
 ```{sql connection=postgresql.connection}
-CREATE TABLE plantae_ecoregions AS
-SELECT 
-plantae.*, 
-ecoregions.ecoregion, 
-ecoregions.realm, 
-ecoregions.biome 
-FROM ecoregions
-JOIN plantae 
-ON ST_Intersects(ecoregions.geom, plantae.geom);
+-- Getting distinct coordinates from plantae to avoid querying on duplicated coordinates
+CREATE TABLE plantae_unique_coordinates AS
+SELECT DISTINCT ON (ST_AsBinary(geom)) 
+geom, latitude, longitude FROM plantae;
+
+-- Spatial index
+CREATE INDEX plantae_unique_coordinates_geom_index ON plantae_unique_coordinates USING GIST (geom);
+
+-- Clustering by gist index
+CLUSTER plantae_unique_coordinates USING plantae_unique_coordinates_geom_index;
 ```
 
+Second, the spatial join between `plantae_unique_coordinates` and `ecoregions`.
+
+```{sql connection=postgresql.connection}
+CREATE TABLE temp_spatial_join AS
+SELECT 
+plantae_unique_coordinates.latitude, 
+plantae_unique_coordinates.longitude, 
+ecoregions.id,
+ecoregions.ecoregion, 
+ecoregions.realm, 
+ecoregions.biome
+FROM ecoregions
+JOIN plantae_unique_coordinates 
+ON ST_Intersects(ecoregions.geom_simple, plantae_unique_coordinates.geom);
+```
+
+Joining `plantae` and `temp_spatial_join` through the common column `id` yields the table `plantae_ecoregions`
+
+```{sql connection=postgresql.connection}
+-- join
+CREATE TABLE plantae_ecoregions AS
+SELECT 
+plantae.id,
+plantae.latitude,
+plantae.longitude,
+plantae.geom,
+plantae.phylum,
+plantae.class,
+plantae.family,
+plantae.genus,
+plantae.species,
+temp_spatial_join.ecoregion,
+temp_spatial_join.realm,
+temp_spatial_join.biome
+FROM plantae, temp_spatial_join
+WHERE (
+  plantae.latitude = temp_spatial_join.latitude 
+  AND plantae.longitude = temp_spatial_join.longitude
+);
+
+-- index, spatial index, and data clustering in the hard disk
+CREATE INDEX plantae_ecoregions_id_index ON plantae_ecoregions (id);
+CREATE INDEX plantae_ecoregions_geom_index ON plantae_ecoregions USING GIST (geom);
+CLUSTER plantae_ecoregions USING plantae_ecoregions_geom_index;
+```
+
+
+**TIP: cancelling a long query**
+
+1. Find the `pid` of the query. This can be achieved by looking at `top` or `htop` for the user `postgres`: 
+  
+```{bash}
+htop -u postgres
+```
+  
+Or by executing the SQL clause
+
+```{sql connection=postgresql.connection}
+SELECT
+  pid,
+  now() - pg_stat_activity.query_start AS duration,
+  query,
+  state
+FROM pg_stat_activity
+WHERE (now() - pg_stat_activity.query_start) > interval '5 minutes';
+```
+
+which finds the running queries, and informs about the time they have been running, and the SQL clause that launched it. To cancel the query...
+
+```{sql connection=postgresql.connection}
+SELECT pg_cancel_backend(xxxx);
+```
+
+...where xxxx is the `pid` number of the query.
+
+
+If a query gets stuck
+
+```{sql connection=postgresql.connection}
+SELECT pg_terminate_backend(xxxx);
+```
+
+It is convenient to stop and restart the PostgreSQL server.
+
+```{bash}
+sudo systemctl restart postgresql
+sudo systemctl status postgresql
+```
+
+
+###Species list per ecoregion
+
+Unique taxonomic units per ecoregion
+
+```{sql connection=postgresql.connection}
+-- for all plant species
+CREATE TABLE ecoregions_species AS
+SELECT 
+DISTINCT (species),
+ecoregion
+FROM plantae_ecoregions;
+
+CREATE TABLE ecoregions_species_taxonomy AS
+SELECT 
+DISTINCT (species),
+genus,
+family,
+class,
+phylum,
+ecoregion
+FROM plantae_ecoregions;
+
+DELETE FROM ecoregions_species_taxonomy
+WHERE NOT (ecoregions_species_taxonomy is NOT NULL);
+
+CREATE TABLE ecoregions_genera AS
+SELECT 
+DISTINCT (genus),
+ecoregion
+FROM plantae_ecoregions;
+
+CREATE TABLE ecoregions_families AS
+SELECT 
+DISTINCT (family),
+ecoregion
+FROM plantae_ecoregions;
+
+CREATE TABLE ecoregions_classes AS
+SELECT 
+DISTINCT (class),
+ecoregion
+FROM plantae_ecoregions;
+
+CREATE TABLE ecoregions_phyla AS
+SELECT 
+DISTINCT (phylum),
+ecoregion
+FROM plantae_ecoregions;
+
+-- for vascular plants only
+CREATE TABLE ecoregions_species_vascular AS
+SELECT 
+DISTINCT (species),
+ecoregion
+FROM plantae_ecoregions
+WHERE phylum = 'Tracheophyta';
+
+CREATE TABLE ecoregions_genera_vascular AS
+SELECT 
+DISTINCT (genus),
+ecoregion
+FROM plantae_ecoregions
+WHERE phylum = 'Tracheophyta';
+
+CREATE TABLE ecoregions_families_vascular AS
+SELECT 
+DISTINCT (family),
+ecoregion
+FROM plantae_ecoregions
+WHERE phylum = 'Tracheophyta';
+
+CREATE TABLE ecoregions_classes_vascular AS
+SELECT 
+DISTINCT (class),
+ecoregion
+FROM plantae_ecoregions
+WHERE phylum = 'Tracheophyta';
+```
+
+For each ecoregion I need to count the total number of spatial records available (repeated records over time were removed in Spark), the number of records available for each species, and the list of species present in the ecoregion. Such data is available in the table `plantae_ecoregions`.
+
+To get the number of records available per ecoregion, I need to sum records in `plantae_ecoregions` grouping by the column `ecoregion`, and then, I need to join the output with the table `ecoregions`.
+
+```{sql connection=postgresql.connection}
+-- creating the column to store results
+ALTER TABLE ecoregions
+ADD COLUMN count_records bigint;
+
+-- computing records per ecoregion
+WITH sq AS (
+  SELECT 
+    plantae_ecoregions.ecoregion,
+    COUNT(*) as count_records
+  FROM plantae_ecoregions 
+GROUP BY plantae_ecoregions.ecoregion
+)
+UPDATE ecoregions
+SET count_records = sq.count_records
+FROM sq
+WHERE ecoregions.ecoregion = sq.ecoregion;
+```
+
+To attach the number of taxa per ecoregion:
+
+```{sql connection=postgresql.connection}
+-- species
+ALTER TABLE ecoregions
+ADD COLUMN count_species bigint;
+
+WITH sq AS (
+SELECT 
+COUNT(*) AS count_species,
+ecoregion
+FROM ecoregions_species
+GROUP BY ecoregion
+)
+UPDATE ecoregions
+SET count_species = sq.count_species
+FROM sq
+WHERE ecoregions.ecoregion = sq.ecoregion;
+
+
+-- genera
+ALTER TABLE ecoregions
+ADD COLUMN count_genera bigint;
+
+WITH sq AS (
+SELECT 
+COUNT(*) AS count_genera,
+ecoregion
+FROM ecoregions_genera
+GROUP BY ecoregion
+)
+UPDATE ecoregions
+SET count_genera = sq.count_genera
+FROM sq
+WHERE ecoregions.ecoregion = sq.ecoregion;
+
+
+--families
+ALTER TABLE ecoregions
+ADD COLUMN count_families bigint;
+
+WITH sq AS (
+SELECT 
+COUNT(*) AS count_families,
+ecoregion
+FROM ecoregions_families
+GROUP BY ecoregion
+)
+UPDATE ecoregions
+SET count_families = sq.count_families
+FROM sq
+WHERE ecoregions.ecoregion = sq.ecoregion;
+
+
+-- classes
+ALTER TABLE ecoregions
+ADD COLUMN count_classes bigint;
+
+WITH sq AS (
+SELECT 
+COUNT(*) AS count_classes,
+ecoregion
+FROM ecoregions_classes
+GROUP BY ecoregion
+)
+UPDATE ecoregions
+SET count_classes = sq.count_classes
+FROM sq
+WHERE ecoregions.ecoregion = sq.ecoregion;
+
+
+-- phyla
+ALTER TABLE ecoregions
+ADD COLUMN count_phyla bigint;
+
+WITH sq AS (
+SELECT 
+COUNT(*) AS count_phyla,
+ecoregion
+FROM ecoregions_phyla
+GROUP BY ecoregion
+)
+UPDATE ecoregions
+SET count_phyla = sq.count_phyla
+FROM sq
+WHERE ecoregions.ecoregion = sq.ecoregion;
+
+-- species of vascular plants
+ALTER TABLE ecoregions
+ADD COLUMN count_species_vascular bigint;
+
+WITH sq AS (
+SELECT 
+COUNT(*) AS count_species_tracheophyta,
+ecoregion
+FROM ecoregions_species_vascular
+GROUP BY ecoregion
+)
+UPDATE ecoregions
+SET count_species_vascular = count_species_vascular
+FROM sq
+WHERE ecoregions.ecoregion = sq.ecoregion;
+
+
+-- genera
+ALTER TABLE ecoregions
+ADD COLUMN count_genera_vascular bigint;
+
+WITH sq AS (
+SELECT 
+COUNT(*) AS count_genera_vascular,
+ecoregion
+FROM ecoregions_genera_vascular
+GROUP BY ecoregion
+)
+UPDATE ecoregions
+SET count_genera_vascular = sq.count_genera_vascular
+FROM sq
+WHERE ecoregions.ecoregion = sq.ecoregion;
+
+
+-- ecoregions
+ALTER TABLE ecoregions
+ADD COLUMN count_families_vascular bigint;
+
+WITH sq AS (
+SELECT 
+COUNT(*) AS count_families_vascular,
+ecoregion
+FROM ecoregions_families
+GROUP BY ecoregion
+)
+UPDATE ecoregions
+SET count_families_vascular = sq.count_families_vascular
+FROM sq
+WHERE ecoregions.ecoregion = sq.ecoregion;
+
+
+-- classes
+ALTER TABLE ecoregions
+ADD COLUMN count_classes_vascular bigint;
+
+WITH sq AS (
+SELECT 
+COUNT(*) AS count_classes_vascular,
+ecoregion
+FROM ecoregions_classes
+GROUP BY ecoregion
+)
+UPDATE ecoregions
+SET count_classes_vascular = sq.count_classes_vascular
+FROM sq
+WHERE ecoregions.ecoregion = sq.ecoregion;
+```
+
+###Adding region names
+
+```{bash}
+shp2pgsql -s 4326 -I /home/blas/Dropbox/RESEARCH/DATA/Global_human_country_limits_shp/world_limits_clean.shp world_limits > /home/blas/Dropbox/RESEARCH/DATA/Global_human_country_limits_shp/world_limits_clean.sql
+```
+
+```{r}
+RPostgreSQL::dbSendQuery(
+  conn = postgresql.connection,
+  statement = readr::read_file('/home/blas/Dropbox/RESEARCH/DATA/Global_human_country_limits_shp/world_limits_clean.sql')
+)
+```
+Spatial index on the `geom` column
+
+```{sql connection=postgresql.connection}
+CREATE INDEX world_limits_geom_index ON world_limits USING GIST (geom);
+```
+
+Dissolving by column `unregion2`.
+
+```{sql connection=}
+-- replacing Europe and Asia with Eurasia
+UPDATE world_limits
+SET unregion2 = 'Eurasia'
+WHERE unregion2 = 'Asia' OR unregion2 = 'Europe';
+
+-- dissolving continents
+CREATE TABLE continents AS
+SELECT ST_Union(geom) AS geom,
+      unregion2 AS continent
+FROM world_limits
+GROUP BY unregion2;
+
+-- removing a null record (Caspian sea)
+DELETE FROM continents
+WHERE continent IS null;
+```
+
+Transferring continent attributes to the `ecoregions` table.
+
+```{sql connection=}
+-- adding continent table
+ALTER TABLE ecoregions
+ADD COLUMN continent varchar;
+```
+
+```{sql connection=}
+-- populating the column
+UPDATE ecoregions
+SET continent = continents.continent
+FROM continents
+WHERE ST_Within(ST_PointOnSurface(ecoregions.geom_simple), continents.geom);
+```
+
+###Computing environmental stats for each ecoregion
+
+I downloaded the *aridity index* by Trabucco and Zomer (URL: [https://cgiarcsi.community/data/global-aridity-and-pet-database](https://cgiarcsi.community/data/global-aridity-and-pet-database)), imported it into GRASS GIS, aggregated it to a resolution of 1km, and computed `1 - aridity index` so maximum aridity is coded as 1 in the map. To classify the map into *aridity levels* I used the following rules (find reference):
+
+0.95 to 1 = hyperarid
+0.80 to 0.95 = arid
+0.50 to 0.80= semiarid
+0.44 to 0.50 = dry subhumid
+0.35 to 0.44 = humid
+-9 to 0.35 = hyperhumid
+
+Other variables added to the dataset are [INCOMPLETE, explain variables here].
+
+I loaded the `Ecoregions2017.shp` file onto GRASS GIS and computed areal stats for the aridity map on each ecoregion.
+
+```{bash}
+#importing the ecoregions vectorial file as ecoregions_aridity
+v.in.ogr -w input=/home/blas/Dropbox/RESEARCH/DATA/Global_bio_ecoregions_Dinerstein_2017/Ecoregions2017_fixed_geometry.shp layer=Ecoregions2017_fixed_geometry output=ecoregions
+
+#copy map with another 
+g.copy vector=ecoregions@PERMANENT,ecoregions_climate
+
+#computing area stats
+v.rast.stats map=ecoregions_climate@PERMANENT raster=climate_aridity_index,climate_PET_seasonality,climate_annual_PET,climate_bio1,climate_bio12,climate_bio4,climate_bio15,climate_bio5,climate_growing_degree_days_5,climate_velocity_LGM,human_footprint,landcover_bare_soil_percent,landcover_herbaceous_percent,landcover_trees_percent,ndvi_min,ndvi_max column_prefix=climate_aridity_index,climate_PET_seasonality,climate_annual_PET,climate_bio1,climate_bio12,climate_bio4,climate_bio15,climate_bio5,climate_growing_degree_days_5,climate_velocity_LGM,human_footprint,landcover_bare_soil_percent,landcover_herbaceous_percent,landcover_trees_percent,ndvi_min,ndvi_max method=minimum,maximum,average
+
+#sending data back to the database flora_ecoregions
+v.out.postgis input=ecoregions_climate@PERMANENT output=PG:dbname=flora_ecoregions output_layer=ecoregions_climate options='GEOMETRY_NAME=geom'
+
+#computing population sum
+g.copy vector=ecoregions@PERMANENT,ecoregions_population
+v.rast.stats map=ecoregions_population@PERMANENT raster=human_population column_prefix=human_population method=sum
+v.out.postgis input=ecoregions_population@PERMANENT output=PG:dbname=flora_ecoregions output_layer=ecoregions_population options='GEOMETRY_NAME=geom'
+
+```
+
+Now that the table `ecoregions_climate` is in the database, I join it with `ecoregions`.
+
+```{sql connection=postgresql.connection}
+-- adding climate columns to ecoregions
+ALTER TABLE ecoregions
+ADD COLUMN climate_aridity_index_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_aridity_index_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_aridity_index_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_pet_seasonality_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_pet_seasonality_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_pet_seasonality_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_annual_pet_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_annual_pet_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_annual_pet_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio1_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio1_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio1_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio12_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio12_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio12_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio4_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio4_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio4_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio15_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio15_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio15_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio5_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio5_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_bio5_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_growing_degree_days_5_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_growing_degree_days_5_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_growing_degree_days_5_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_velocity_lgm_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_velocity_lgm_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN climate_velocity_lgm_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN human_footprint_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN human_footprint_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN human_footprint_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN landcover_bare_soil_percent_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN landcover_bare_soil_percent_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN landcover_bare_soil_percent_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN landcover_herbaceous_percent_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN landcover_herbaceous_percent_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN landcover_herbaceous_percent_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN landcover_trees_percent_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN landcover_trees_percent_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN landcover_trees_percent_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN ndvi_min_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN ndvi_min_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN ndvi_min_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN ndvi_max_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN ndvi_max_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN ndvi_max_average numeric;
+
+
+
+-- populating aridity columns from ecoregions_aridity
+UPDATE ecoregions 
+   SET climate_aridity_index_minimum = ecoregions_climate.climate_aridity_index_minimum, 
+       climate_aridity_index_maximum = ecoregions_climate.climate_aridity_index_maximum, 
+       climate_aridity_index_average = ecoregions_climate.climate_aridity_index_average,
+       climate_pet_seasonality_minimum = ecoregions_climate."climate_PET_seasonality_minimum", 
+       climate_pet_seasonality_maximum = ecoregions_climate."climate_PET_seasonality_maximum", 
+       climate_pet_seasonality_average = ecoregions_climate."climate_PET_seasonality_average",
+       climate_annual_pet_minimum = ecoregions_climate."climate_annual_PET_minimum", 
+       climate_annual_pet_maximum = ecoregions_climate."climate_annual_PET_maximum", 
+       climate_annual_pet_average = ecoregions_climate."climate_annual_PET_average",
+       climate_bio1_minimum = ecoregions_climate.climate_bio1_minimum, 
+       climate_bio1_maximum = ecoregions_climate.climate_bio1_maximum, 
+       climate_bio1_average = ecoregions_climate.climate_bio1_average,
+       climate_bio12_minimum = ecoregions_climate.climate_bio12_minimum, 
+       climate_bio12_maximum = ecoregions_climate.climate_bio12_maximum, 
+       climate_bio12_average = ecoregions_climate.climate_bio12_average,
+       climate_bio4_minimum = ecoregions_climate.climate_bio4_minimum, 
+       climate_bio4_maximum = ecoregions_climate.climate_bio4_maximum, 
+       climate_bio4_average = ecoregions_climate.climate_bio4_average,
+       climate_bio15_minimum = ecoregions_climate.climate_bio15_minimum, 
+       climate_bio15_maximum = ecoregions_climate.climate_bio15_maximum, 
+       climate_bio15_average = ecoregions_climate.climate_bio15_average,
+       climate_bio5_minimum = ecoregions_climate.climate_bio5_minimum, 
+       climate_bio5_maximum = ecoregions_climate.climate_bio5_maximum, 
+       climate_bio5_average = ecoregions_climate.climate_bio5_average,
+       climate_growing_degree_days_5_minimum = ecoregions_climate.climate_growing_degree_days_5_minimum, 
+       climate_growing_degree_days_5_maximum = ecoregions_climate.climate_growing_degree_days_5_maximum, 
+       climate_growing_degree_days_5_average = ecoregions_climate.climate_growing_degree_days_5_average,
+       climate_velocity_lgm_minimum = ecoregions_climate."climate_velocity_LGM_minimum", 
+       climate_velocity_lgm_maximum = ecoregions_climate."climate_velocity_LGM_maximum", 
+       climate_velocity_lgm_average = ecoregions_climate."climate_velocity_LGM_average",
+       human_footprint_minimum = ecoregions_climate.human_footprint_minimum, 
+       human_footprint_maximum = ecoregions_climate.human_footprint_maximum, 
+       human_footprint_average = ecoregions_climate.human_footprint_average,
+       landcover_bare_soil_percent_minimum = ecoregions_climate.landcover_bare_soil_percent_minimum, 
+       landcover_bare_soil_percent_maximum = ecoregions_climate.landcover_bare_soil_percent_maximum, 
+       landcover_bare_soil_percent_average = ecoregions_climate.landcover_bare_soil_percent_average,
+       landcover_herbaceous_percent_minimum = ecoregions_climate.landcover_herbaceous_percent_minimum, 
+       landcover_herbaceous_percent_maximum = ecoregions_climate.landcover_herbaceous_percent_maximum, 
+       landcover_herbaceous_percent_average = ecoregions_climate.landcover_herbaceous_percent_average,
+       landcover_trees_percent_minimum = ecoregions_climate.landcover_trees_percent_minimum, 
+       landcover_trees_percent_maximum = ecoregions_climate.landcover_trees_percent_maximum, 
+       landcover_trees_percent_average = ecoregions_climate.landcover_trees_percent_average,
+       ndvi_min_minimum = ecoregions_climate.ndvi_min_minimum, 
+       ndvi_min_maximum = ecoregions_climate.ndvi_min_maximum, 
+       ndvi_min_average = ecoregions_climate.ndvi_min_average,
+       ndvi_max_minimum = ecoregions_climate.ndvi_max_minimum, 
+       ndvi_max_maximum = ecoregions_climate.ndvi_max_maximum, 
+       ndvi_max_average = ecoregions_climate.ndvi_max_average
+FROM ecoregions_climate
+WHERE ecoregions.ecoregion = ecoregions_climate.eco_name;
+
+-- adding and updating human_population and human population density columns
+ALTER TABLE ecoregions
+ADD COLUMN human_population numeric;
+
+UPDATE ecoregions 
+   SET human_population = human_population_sum
+   FROM ecoregions_population
+   WHERE ecoregions.ecoregion = ecoregions_population.eco_name;
+   
+ALTER TABLE ecoregions
+ADD COLUMN human_population_density numeric;
+
+UPDATE ecoregions 
+   SET human_population_density = human_population / area;
+```
+
+The same operation is repeated with the average, minimum, maximum, and range of the variables elevation, latitude, and longitude.
+
+```{bash}
+#copy map with another 
+g.copy vector=ecoregions@PERMANENT,ecoregions_geography
+
+#computing area stats
+v.rast.stats map=ecoregions_geography@PERMANENT raster=geo_latitude,geo_longitude,topography_elevation column_prefix=geo_latitude,geo_longitude,topography_elevation method=minimum,maximum,average,range
+
+#sending data back to the database flora_ecoregions
+v.out.postgis input=ecoregions_geography@PERMANENT output=PG:dbname=flora_ecoregions output_layer=ecoregions_geography options='GEOMETRY_NAME=geom'
+```
+
+```{sql connection=postgresql.connection}
+-- adding climate columns to ecoregions
+ALTER TABLE ecoregions
+ADD COLUMN geo_latitude_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN geo_latitude_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN geo_latitude_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN geo_latitude_range numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN geo_longitude_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN geo_longitude_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN geo_longitude_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN geo_longitude_range numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN topography_elevation_minimum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN topography_elevation_maximum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN topography_elevation_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN topography_elevation_range numeric;
+
+
+-- populating aridity columns from ecoregions_aridity
+UPDATE ecoregions 
+   SET geo_latitude_minimum = ecoregions_geography.geo_latitude_minimum,
+       geo_latitude_maximum = ecoregions_geography.geo_latitude_maximum,
+       geo_latitude_average = ecoregions_geography.geo_latitude_average,
+       geo_latitude_range = ecoregions_geography.geo_latitude_range,
+       geo_longitude_minimum = ecoregions_geography.geo_longitude_minimum,
+       geo_longitude_maximum = ecoregions_geography.geo_longitude_maximum,
+       geo_longitude_average = ecoregions_geography.geo_longitude_average,
+       geo_longitude_range = ecoregions_geography.geo_longitude_range,
+       topography_elevation_minimum = ecoregions_geography.topography_elevation_minimum,
+       topography_elevation_maximum = ecoregions_geography.topography_elevation_maximum,
+       topography_elevation_average = ecoregions_geography.topography_elevation_average,
+       topography_elevation_range = ecoregions_geography.topography_elevation_range
+FROM ecoregions_geography
+WHERE ecoregions.ecoregion = ecoregions_geography.eco_name;
+```
+
+There are several records in ecoregions that return NULL for a given column. To delete any rows with a NULL:
+
+```{sql connection=}
+DELETE FROM ecoregions
+WHERE NOT (ecoregions is NOT NULL);
+```
+
+For the next steps, the `ecoregions` table needs a geom column with a buffer on `geom` to later find intersections among nearby ecoregions. This is needed because the polygons of several ecoregions are not really connected to their neighboring ecoregions ("Gibson desert" is an example of this, ST_Touches returns no neighbors for this and many other ecoregions).
+
+```{sql connection=}
+ALTER TABLE ecoregions
+ADD COLUMN geom_buffer geometry;
+
+UPDATE ecoregions
+SET geom_buffer = ST_Buffer(ST_MakeValid(geom::geography), 0.1);
+
+CREATE INDEX ecoregions_geom_buffer_index ON ecoregions USING GIST (geom_buffer);
+```
+
+
+The table `arid_ecoregions`, from `ecoregions` where average aridity is equal or higher than 0.44 (lower limit of *dry-subhumid*) will be used to identify the targets of the study.
+
+```{sql connection=}
+-- subsetting arid ecoregions
+CREATE TABLE arid_ecoregions AS
+SELECT * FROM ecoregions
+WHERE climate_aridity_index_average >= '0.44';
+
+CREATE INDEX arid_ecoregions_id_index ON arid_ecoregions (id);
+CREATE INDEX arid_ecoregions_geom_index ON arid_ecoregions USING GIST (geom);
+```
+
+Pairing ecoregions and computing differences in area, aridity, species numbers, and others.
+
+```{sql connection=}
+-- copy of ecoregions
+CREATE TABLE ecoregions_copy AS
+SELECT * FROM ecoregions;
+
+CREATE INDEX ecoregions_copy_id_index ON ecoregions_copy (id);
+CREATE INDEX ecoregions_copy_geom_index ON ecoregions_copy USING GIST (geom);
+```
+
+```{sql connection=postgresql.connection}
+SET max_parallel_workers_per_gather = 6;
+
+CREATE TABLE ecoregions_pairs AS
+SELECT 
+ecoregions_copy.ecoregion as target_ecoregion,
+ecoregions.ecoregion as neighbor_ecoregion,
+ecoregions_copy.geom as target_ecoregion_geom,
+ecoregions.geom as neighbor_ecoregion_geom,
+ecoregions.conservation_assessment as target_conservation_assessment,
+ecoregions_copy.conservation_assessment as neighbor_conservation_assessment,
+ecoregions_copy.climate_aridity_index_average as target_ecoregion_climate_aridity_index_average,
+ecoregions.climate_aridity_index_average as neighbor_ecoregion_climate_aridity_index_average,
+ecoregions_copy.climate_aridity_index_minimum as target_ecoregion_climate_aridity_index_minimum,
+ecoregions.climate_aridity_index_minimum as neighbor_ecoregion_climate_aridity_index_minimum,
+ecoregions_copy.climate_aridity_index_maximum as target_ecoregion_climate_aridity_index_maximum,
+ecoregions.climate_aridity_index_maximum as neighbor_ecoregion_climate_aridity_index_maximum,
+ecoregions_copy.geo_latitude_average as target_ecoregion_geo_latitude_average,
+ecoregions.geo_latitude_average as neighbor_ecoregion_geo_latitude_average,
+ecoregions_copy.geo_longitude_average as target_ecoregion_geo_longitude_average,
+ecoregions.geo_longitude_average as neighbor_ecoregion_geo_longitude_average,
+ecoregions_copy.topography_elevation_average as target_ecoregion_topography_elevation_average,
+ecoregions.topography_elevation_average as neighbor_ecoregion_topography_elevation_average,
+ecoregions_copy.topography_elevation_range as target_ecoregion_topography_elevation_range,
+ecoregions.topography_elevation_range as neighbor_ecoregion_topography_elevation_range,
+ecoregions_copy.biome as target_biome,
+ecoregions.biome as neighbor_biome,
+CASE 
+  WHEN ecoregions_copy.biome = ecoregions.biome THEN 'same biome'
+  WHEN ecoregions_copy.biome != ecoregions.biome THEN 'different biome'
+  END same_biome,
+ecoregions_copy.realm as target_realm,
+ecoregions.realm as neighbor_realm,
+CASE 
+  WHEN ecoregions_copy.realm = ecoregions.realm THEN 'same realm'
+  WHEN ecoregions_copy.realm != ecoregions.realm THEN 'different realm'
+  END same_realm,
+ecoregions_copy.continent as target_continent,
+ecoregions.continent as neighbor_continent,
+CASE 
+  WHEN ecoregions_copy.continent = ecoregions.continent THEN 'same continent'
+  WHEN ecoregions_copy.continent != ecoregions.continent THEN 'different continent'
+  END same_continent,
+ST_Distance(ecoregions_copy.geom_buffer::geography, ecoregions.geom_buffer::geography)/1000 as geographic_distance_km,
+ST_Intersects(ecoregions_copy.geom_buffer, ecoregions.geom_buffer) as connected,
+ST_AsText(ST_ClosestPoint(ecoregions_copy.geom, ecoregions.geom)) as target_ecoregion_geom_closest_pt,
+ST_AsText(ST_ClosestPoint(ecoregions.geom, ecoregions_copy.geom)) as neighbor_ecoregion_geom_closest_pt,
+ecoregions_copy.area as target_area,
+ecoregions.area as neighbor_area,
+ecoregions_copy.area - ecoregions.area as area_diff,
+ecoregions_copy.perimeter as target_perimeter,
+ecoregions.perimeter as neighbor_perimeter,
+ecoregions_copy.perimeter - ecoregions.perimeter as perimeter_diff,
+ecoregions_copy.count_species - ecoregions.count_species as count_species_diff,
+ecoregions_copy.count_genera - ecoregions.count_genera as count_genera_diff,
+ecoregions_copy.count_families - ecoregions.count_families as count_families_diff,
+ecoregions_copy.count_classes - ecoregions.count_classes as count_classes_diff,
+ecoregions_copy.count_phyla - ecoregions.count_phyla as count_phyla_diff,
+ecoregions_copy.count_species_vascular - ecoregions.count_species_vascular as count_species_vascular_diff,
+ecoregions_copy.count_genera_vascular - ecoregions.count_genera_vascular as count_genera_vascular_diff,
+ecoregions_copy.count_families_vascular - ecoregions.count_families_vascular as count_families_vascular_diff,
+ecoregions_copy.count_classes_vascular - ecoregions.count_classes_vascular as count_classes_vascular_diff,
+ecoregions_copy.climate_aridity_index_average - ecoregions.climate_aridity_index_average as climate_aridity_index_diff,
+ecoregions_copy.climate_pet_seasonality_average - ecoregions.climate_pet_seasonality_average as climate_pet_seasonality_average_diff,
+ecoregions_copy.climate_annual_pet_average - ecoregions.climate_annual_pet_average as climate_annual_pet_average_diff,
+ecoregions_copy.climate_bio1_average - ecoregions.climate_bio1_average as climate_bio1_average_diff,
+ecoregions_copy.climate_bio12_average - ecoregions.climate_bio12_average as climate_bio12_average_diff,
+ecoregions_copy.climate_bio4_average - ecoregions.climate_bio4_average as climate_bio4_average_diff,
+ecoregions_copy.climate_bio15_average - ecoregions.climate_bio15_average as climate_bio15_average_diff,
+ecoregions_copy.climate_bio5_average - ecoregions.climate_bio5_average as climate_bio5_average_diff,
+ecoregions_copy.climate_growing_degree_days_5_average - ecoregions.climate_growing_degree_days_5_average as climate_growing_degree_days_5_average_diff,
+ecoregions_copy.climate_velocity_lgm_average - ecoregions.climate_velocity_lgm_average as climate_velocity_lgm_average_diff,
+ecoregions_copy.human_footprint_average - ecoregions.human_footprint_average as human_footprint_average_diff,
+ecoregions.human_population - ecoregions_copy.human_population as human_population_diff,
+ecoregions.human_population_density - ecoregions_copy.human_population_density as human_population_density_diff,
+ecoregions_copy.landcover_bare_soil_percent_average - ecoregions.landcover_bare_soil_percent_average as landcover_bare_soil_percent_average_diff,
+ecoregions_copy.landcover_herbaceous_percent_average - ecoregions.landcover_herbaceous_percent_average as landcover_herbaceous_percent_average_diff,
+ecoregions_copy.landcover_trees_percent_average - ecoregions.landcover_trees_percent_average as landcover_trees_percent_average_diff,
+ecoregions_copy.ndvi_min_average - ecoregions.ndvi_min_average as ndvi_min_diff,
+ecoregions_copy.ndvi_max_average - ecoregions.ndvi_max_average as ndvi_max_diff,
+ecoregions_copy.geo_latitude_average - ecoregions.geo_latitude_average as geo_latitude_diff,
+ecoregions_copy.geo_longitude_average - ecoregions.geo_longitude_average as geo_longitude_diff,
+ecoregions_copy.topography_elevation_average - ecoregions.topography_elevation_average as topography_elevation_diff
+FROM ecoregions_copy, ecoregions
+WHERE ecoregions_copy.ecoregion != ecoregions.ecoregion 
+AND ecoregions_copy.area >= '10000' 
+AND ecoregions.area >= '10000';
+```
+
+Here I also compute the length of the shared edge of each pair of connecting ecoregions.
+
+```{sql connection=postgresql.connection}
+-- create new column
+ALTER TABLE ecoregions_pairs
+ADD COLUMN shared_edge_length numeric;
+
+-- zero as default value
+ALTER TABLE ecoregions_pairs
+ALTER COLUMN shared_edge_length
+SET DEFAULT 0;
+
+UPDATE ecoregions_pairs
+SET shared_edge_length = ST_Length(ST_CollectionExtract(ST_Intersection(ST_MakeValid(target_ecoregion_geom), ST_MakeValid(neighbor_ecoregion_geom)), 2))
+WHERE connected = 'true';
+
+-- For some reason NULLs arised in the new column
+UPDATE ecoregions_pairs
+SET shared_edge_length=0
+WHERE shared_edge_length IS NULL;
+
+```
+
+
+## Computing environmental overlap between ecoregions
+
+Here we use the D measure [expand this] to assess the overlap in the environmental space between pairs of ecoregions. The steps to do so are:
+
+- Load and select uncorrelated rasters representing the environment of the ecoregions.
+- Read geometry of both ecoregions.
+- Extract raster values within the polygons of these. ecoregions
+- Compute D on each pair of ecoregions
+
+###Loading and selecting raster files
+
+The raster files used here at 5km resolution are located at `data/geotif`. Here I only use climate variables to compute climate distances among ecoregions.
+
+```{r}
+#list of rasters on disk
+variables <- list.files(
+  path="data/geotif",
+  pattern='climate_*', 
+  full.names=TRUE
+  ) %>% 
+  raster::stack() %>% 
+  raster::brick()
+  
+names(variables)
+```
+
+To select the variables the stack needs to be turned into a dataframe
+
+```{r}
+variables.df <- raster::as.data.frame(variables) %>% 
+  na.omit()
+```
+
+To select a set of uncorrelated variables here I use the custom function `s_lower_vif`, that computes the variance inflation factor for every variable, trying to preserve the ones provided in the argument `preference.order` in the same order they are provided. Following the advice provided here https://quantifyinghealth.com/vif-threshold/ we use a VIF = 2.5 as threshold.
+
+```{r}
+variable.selection <- s_lower_vif(
+  training.df = variables.df,
+  preference.order = c(#prioritising more traditional and well understood climate variables
+    "climate_bio1",
+    "climate_bio4",
+    "climate_bio12",
+    "climate_bio15"
+    ),
+  omit.cols = c(
+    "climate_velocity_LGM", #not interested in this variable for this part of the analysis
+    "climate_growing_degree_days_0", #seems to be causing some issues (cor with others yields
+    "climate_PET_wettest_quarter" #not an interesting variable
+    )
+  )
+variable.selection
+```
+
+Subsetting variables stack
+
+```{r, fig.width = 12, fig.height = 5}
+#subsetting and scaling variables
+variables <- raster::scale(variables[[variable.selection$vars]])
+
+#plotting vars
+ plot(
+  variables, 
+  col = viridis::viridis(100)
+  )
+
+#saving to .RData
+save(variables, variable.selection, file = "variables_hypervolume_overlap.RData")
+```
+
+Removing unneeded objects
+
+```{r}
+rm(variables.df)
+gc()
+```
+
+
+###Reading geometry of ecoregions
+
+The geometry of a given database table can be retrieved with `rpostgis::pgGetGeom()` as follows.
+
+```{r}
+#name of a ecoregion
+ecoregion.target <- "Aegean and Western Turkey sclerophyllous and mixed forests"
+
+#pulling geometry with rpostgis
+ecoregion.target.geom <- rpostgis::pgGetGeom(
+  conn = postgresql.connection,
+  name = c("public", "ecoregions"),
+  geom = "geom",
+  other.cols = c("ecoregion"),
+  clauses = paste(
+    "WHERE ecoregion = '", 
+    ecoregion.target, 
+    "';", 
+    sep = ""
+    )
+  )
+```
+
+To simplify the process I have written the function `pull_ecoregion_geom()` located in the file functions.R acompanying this document.
+
+```{r}
+ecoregion.target.geom <- pull_ecoregion_geom(
+  ecoregion = ecoregion.target
+)
+```
+
+###Extracting raster values for an ecoregion
+
+The values of the raster brick `variables` can be extracted for the locations of these polygons with `raster::extract()`.
+
+```{r}
+ecoregion.target.climate <- raster::extract(
+  x = variables,
+  y = ecoregion.target.geom,
+  df = TRUE,
+  cellnumbers = FALSE
+  ) %>% 
+  na.omit() %>% 
+  dplyr::select(-ID) %>% 
+  dplyr::mutate(
+    ecoregion = ecoregion.target
+  )
+str(ecoregion.target.climate)
+```
+
+To simplify the operation I have written the function `ecoregion_raster_extract` that pulls the ecoregion geom and runs the extract at once.
+
+```{r}
+  ecoregion.target.climate <- ecoregion_raster_extract(
+  ecoregion = ecoregion.target,
+  raster = variables
+)
+head(ecoregion.target.climate)
+```
+
+## Environmental breadth and climatic distances among ecoregions
+
+How similar is the climate of each pair of ecoregions?
+
+###Computing the climate hypervolume of ecoregions
+
+The `hypervolume` package [reference] allows to compute the hypervolume a set of locations over a group of uncorrelated environmental variables.
+
+```{r}
+hv <- hypervolume::hypervolume_svm(
+  data = ecoregion.target.climate[sample(
+    1:nrow(ecoregion.target.climate), 
+    5000
+    ), names(variables)],
+  name = ecoregion.target,
+  verbose = FALSE,
+  chunk.size = 20000
+  )
+plot(hv)
+```
+
+The function `ecoregion_hypervolume()` returns the hypervolume of any given ecoregion by pulling its geom, extracting its raster values, and computing the hypervolume with `hypervolume::hypervolume_svm()`.
+
+```{r}
+hv <- ecoregion_hypervolume(
+  ecoregion = ecoregion.target,
+  raster = variables
+)
+plot(hv)
+```
+
+Here I compute the hypervolume for every ecoregion in the table `ecoregions`, but only for ecoregions with an area higher than 2 (units unclear).
+
+```{r}
+#names of ecoregions
+ecoregion_names <- RPostgreSQL::dbGetQuery(
+  conn = postgresql.connection,
+  statement = "SELECT ecoregion FROM ecoregions WHERE area >= 10000"
+)
+```
+
+For each one of these ecoregions I use `ecoregion_hypervolume()` to compute their hypervolume, and save it in a list named `hypervolumes_ecoregions`.
+
+```{r}
+#list to save results
+hypervolumes_ecoregions <- list()
+
+#looping through ecoregions
+for(i in 1:nrow(ecoregion_names)){
+  
+  print(paste("Iteration ", i, " of ", nrow(ecoregion_names), sep = ""))
+  
+  #getting ecoregion name
+  ecoregion.name <- ecoregion_names[i, "ecoregion"]
+  
+  #computing hypervolume
+  hv <- try(
+    ecoregion_hypervolume(
+      ecoregion = ecoregion.name,
+      raster = variables
+    )
+  )
+  
+  #if it failed, jumps to next iteration
+  if(inherits(hv, "try-error")){
+    next
+  } else {
+    #save result
+    hypervolumes_ecoregions[[ecoregion.name]] <- hv
+    }
+  
+}
+
+save(hypervolumes_ecoregions, file = "hypervolumes_ecoregions.RData")
+```
+
+### Overlap between the hypervolumes of ecoregions
+
+The overlap between hypervolumes of two different ecoregions can be computed by first grouping both hypervolumes into a set with `hypervolume::hypervolume_set()` and then obtaining the overlap with `hypervolume::hypervolume_overlap_statistics()`. Below I show an example with two adjacent ecoregions in the Anatolian peninsula
+  
+```{r}
+hv.a <- ecoregion_hypervolume(
+  ecoregion = "Aegean and Western Turkey sclerophyllous and mixed forests",
+  raster = variables
+)
+
+hv.b <- ecoregion_hypervolume(
+  ecoregion = "Anatolian conifer and deciduous mixed forests",
+  raster = variables
+)
+
+#set of hypervolumes
+hv.set <- hypervolume::hypervolume_set(
+  hv1 = hv.a,
+  hv2 = hv.b,
+  check.memory = FALSE
+)
+
+#overlap
+hv.overlap <- hypervolume::hypervolume_overlap_statistics(hvlist = hv.set)
+hv.overlap
+```
+
+```{r}
+rm(ecoregion.data, ecoregion.names, ecoregion.target.climate, ecoregion.target.geom, hv, hv.a, hv.b, hv.set, hypervolume_ecoregions, raster, variable.selection, variables)
+gc()
+```
+
+
+## Habitat fragmentation of ecoregions
+
+There are ecoregions that cover extense and continuous areas, while others are heavily fragmented. To assess the degree of coherence of the different ecoregions here I use the R package `landscapemetrics` (Hesselbarth et al. 2019), that provides a large set of habitat fragmentation stats available in the traditional [`FRAGSTATS`](tps://www.umass.edu/landeco/research/fragstats/fragstats.html) software.
+
+Using `landscapemetrics` on the `geom` column of the `ecoregions` table requires the following steps:
+
++  Pull the geometry with `pull_ecoregion_geom()`.
++  Transform to a planar coordinate reference system in meters.
++  Convert into a raster with a resolutionin meters. 
++  Compute metrics at the patch level, class level, or landscape level.
+
+```{r}
+#pulling geometry of ecoregion and reprojecting to LAEA
+ecoregion.geom <- pull_ecoregion_geom(
+  ecoregion = "Flint Hills tallgrass prairie"
+  ) %>% 
+  sp::spTransform(CRSobj = "+proj=laea")
+
+#creating raster template at 5km resolution
+raster.template <- raster::raster(
+  x = ecoregion.geom, 
+  resolution = 5000
+  )
+
+#rasterizing geom
+ecoregion.geom.raster <- raster::rasterize(
+  x = ecoregion.geom,
+  y = raster.template,
+  background = 0
+)
+
+#computing fragmentation measures
+ecoregion.fragmentation <- landscapemetrics::calculate_lsm(
+  landscape = ecoregion.geom.raster,
+  what = c(
+    "lsm_c_ca", #total (class) area
+    "lsm_c_te", #total edge
+    "lsm_c_ed", #edge density
+    "lsm_c_ai", #aggregation index	
+    "lsm_c_cohesion", #patch cohesion index	
+    "lsm_c_division", #division index
+    "lsm_c_clumpy", #clumpiness index
+    "lsm_c_lsi", #landscape shape index	
+    "lsm_c_nlsi", #normalized landscape shape index
+    "lsm_c_mesh", #effective mesh size	
+    "lsm_c_tca", #total core area
+    "lsm_c_cpland", #core area percentage of landscape	
+    "lsm_c_core_mn", #core area mean
+    "lsm_c_dcore_mn", #mean disjunct core area
+    "lsm_c_ndca", #number of disjunct core areas
+    "lsm_c_dcad", #disjunct core area density
+    "lsm_c_np", #number of patches
+    "lsm_c_pd", #patch density
+    "lsm_c_area_mn", #mean patch area
+    "lsm_c_contig_mn", #contiguity index mean
+    "lsm_c_para_mn", #perimeter area ratio mean
+    "lsm_c_shape_mn" #shape index mean
+    )
+  ) %>% 
+  dplyr::filter(
+    class == 1
+  ) %>% 
+  dplyr::select(
+    metric,
+    value
+  ) %>% 
+  as.data.frame()
+```
+
+I implemented these operations in the function `ecoregion_fragmentation()`, that I used to extract fragmentation measures for every ecoregion with an area larger than 2.
+
+```{r}
+#list to save results
+fragmentation_ecoregions <- list()
+
+#looping through ecoregions
+for(i in 1:nrow(ecoregion.names)){
+  
+  #getting ecoregion name
+  ecoregion.name <- ecoregion.names[i, "ecoregion"]
+  
+  #computing fragmentation
+  ef <- try(ecoregion_fragmentation(ecoregion = ecoregion.name))
+  
+  #if it failed, jumps to next iteration
+  if(inherits(ef, "try-error")){
+    next
+  } else {
+    #save result
+    ef$ecoregion <- ecoregion.name
+    fragmentation_ecoregions[[ecoregion.name]] <- ef
+    }
+  
+}
+
+#to dataframe
+fragmentation_ecoregions <- do.call(
+  "rbind",
+  fragmentation_ecoregions
+  ) %>% 
+  tidyr::pivot_wider(
+    names_from = "metric", 
+    values_from = "value"
+    ) %>% 
+  dplyr::rename_at(vars(ai:te), function(x){paste0("fragmentation_", x)})
+
+#saving for later
+save(fragmentation_ecoregions, file = "fragmentation_ecoregions.RData")
+```
+
+### Finding the neighbors of each ecoregion
+
+The table `ecoregions_pairs` contains the column `connected`, that yields true when two ecoregions share a border. To find the direct neighbors of each ecoregion I subset the table where `connected` equals "true".
+
+```{sql connection=postgresql.connection}
+CREATE TABLE ecoregions_neighbors AS
+SELECT target_ecoregion AS ecoregion,
+      neighbor_ecoregion AS neighbor,
+      target_perimeter AS ecoregion_perimeter,
+      neighbor_area,
+      neighbor_perimeter,
+      shared_edge_length,
+      target_ecoregion_climate_aridity_index_average AS ecoregion_average_aridity,
+      neighbor_ecoregion_climate_aridity_index_average AS neighbor_average_aridity,
+      ecoregions.count_species AS neighbor_count_species,
+      ecoregions.count_genera AS neighbor_count_genera,
+      ecoregions.count_families AS neighbor_count_families,
+      ecoregions.count_classes AS neighbor_count_classes,
+      ecoregions.count_species_vascular AS neighbor_count_species_vascular,
+      ecoregions.count_genera_vascular AS neighbor_count_genera_vascular,
+      ecoregions.count_families_vascular AS neighbor_count_families_vascular,
+      ecoregions.count_classes_vascular AS neighbor_count_classes_vascular,
+      ecoregions.count_phyla AS neighbor_count_phyla
+FROM ecoregions_pairs, ecoregions
+WHERE connected = 'true'
+AND ecoregions_pairs.neighbor_ecoregion = ecoregions.ecoregion
+ORDER BY ecoregion, neighbor;
+```
+
+Now this table needs to be aggregated in order to associate with each record in `ecoregions` the amount of border shared with other ecoregions, the sum of the area of the neighboring ecoregions, and the total number of taxa available in neighboring ecoregions.
+
+```{sql connection=postgresql.connection}
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_count integer;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_area_sum numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_percentage_shared_edge numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_average_aridity numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_species_count_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_genera_count_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_families_count_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_classes_count_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_phyla_count_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_species_vascular_count_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_genera_vascular_count_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_families_vascular_count_average numeric;
+
+ALTER TABLE ecoregions
+ADD COLUMN neighbors_classes_vascular_count_average numeric;
+```
+
+```{sql connection=postgresql.connection}
+UPDATE ecoregions
+SET 
+neighbors_count = temp.neighbors_count,
+neighbors_area_sum = temp.neighbors_area_sum,
+neighbors_percentage_shared_edge = temp.neighbors_percentage_shared_edge,
+neighbors_average_aridity = temp.neighbors_average_aridity,
+neighbors_species_count_average = temp.neighbors_species_count_average,
+neighbors_genera_count_average = temp.neighbors_genera_count_average,
+neighbors_families_count_average = temp.neighbors_families_count_average,
+neighbors_classes_count_average = temp.neighbors_classes_count_average,
+neighbors_phyla_count_average = temp.neighbors_phyla_count_average,
+neighbors_species_vascular_count_average = temp.neighbors_species_vascular_count_average,
+neighbors_genera_vascular_count_average = temp.neighbors_genera_vascular_count_average,
+neighbors_families_vascular_count_average = temp.neighbors_families_vascular_count_average,
+neighbors_classes_vascular_count_average = temp.neighbors_classes_vascular_count_average
+FROM 
+(
+SELECT
+ecoregion,
+COUNT(neighbor) AS neighbors_count,
+SUM(neighbor_area) AS neighbors_area_sum,
+(SUM(shared_edge_length) * 100) / ecoregion_perimeter AS neighbors_percentage_shared_edge,
+AVG(neighbor_average_aridity) AS neighbors_average_aridity,
+AVG(neighbor_count_species) AS neighbors_species_count_average,
+AVG(neighbor_count_genera) AS neighbors_genera_count_average,
+AVG(neighbor_count_families) AS neighbors_families_count_average,
+AVG(neighbor_count_classes) AS neighbors_classes_count_average,
+AVG(neighbor_count_species_vascular) AS neighbors_species_vascular_count_average,
+AVG(neighbor_count_genera_vascular) AS neighbors_genera_vascular_count_average,
+AVG(neighbor_count_families_vascular) AS neighbors_families_vascular_count_average,
+AVG(neighbor_count_classes_vascular) AS neighbors_classes_vascular_count_average,
+AVG(neighbor_count_phyla) AS neighbors_phyla_count_average
+FROM ecoregions_neighbors
+GROUP BY ecoregion, ecoregion_perimeter
+) temp
+WHERE temp.ecoregion = ecoregions.ecoregion;
+```
+
+A list with ecoregions with no neighbors is needed as well for subsetting purposes.
+
+```{sql connection=postgresql.connection}
+CREATE TABLE ecoregions_isolated AS
+SELECT DISTINCT ecoregions.ecoregion
+FROM ecoregions, ecoregions_neighbors
+WHERE ecoregions.ecoregion NOT IN (
+SELECT ecoregion 
+FROM ecoregions_neighbors
+)
+ORDER BY ecoregion;
+```
+
+## Computing betadiversity scores between ecoregions
+
+To compute betadiversity scores I first load the required tables into the R environment. In this step I will change the names of several columns to better represent the underlying structure of the data.
+
+```{r}
+ecoregions <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT
+  ecoregion AS ecoregion_name,
+  biome AS ecoregion_biome,
+  realm AS ecoregion_realm,
+  continent AS ecoregion_continent,
+  area AS ecoregion_area_km2,
+  count_records AS bias_records,
+  records_per_km2 AS bias_records_per_km2,
+  count_species / count_records AS bias_species_per_record,
+  count_species / records_per_km2 AS bias_species_per_record_per_km2,
+  count_species AS richness_species,
+  count_genera AS richness_genera,
+  count_families AS richness_families,
+  count_classes AS richness_classes,
+  count_phyla AS richness_phyla,
+  count_species_vascular AS richness_species_vascular,
+  count_genera_vascular AS richness_genera_vascular,
+  count_families_vascular AS richness_families_vascular,
+  count_classes_vascular AS richness_classes_vascular,
+  neighbors_count,
+  neighbors_area_sum AS neighbors_area,
+  neighbors_percentage_shared_edge,
+  neighbors_average_aridity,
+  neighbors_species_count_average,
+  neighbors_genera_count_average,
+  neighbors_families_count_average,
+  neighbors_classes_count_average,
+  conservation_assessment AS human_conservation_assessment,
+  human_population,
+  human_population_density,
+  human_footprint_minimum,
+  human_footprint_maximum,
+  human_footprint_average,
+  climate_aridity_index_minimum,
+  climate_aridity_index_maximum,
+  climate_aridity_index_average,
+  climate_bio1_minimum,
+  climate_bio1_maximum,
+  climate_bio1_average,
+  climate_bio4_minimum,
+  climate_bio4_maximum,
+  climate_bio4_average,
+  climate_bio5_minimum,
+  climate_bio5_maximum,
+  climate_bio5_average,
+  climate_bio12_minimum,
+  climate_bio12_maximum,
+  climate_bio12_average,
+  climate_bio15_minimum,
+  climate_bio15_maximum,
+  climate_bio15_average,
+  climate_growing_degree_days_5_minimum,
+  climate_growing_degree_days_5_maximum,
+  climate_growing_degree_days_5_average,
+  climate_velocity_lgm_minimum,
+  climate_velocity_lgm_maximum,
+  climate_velocity_lgm_average,
+  landcover_bare_soil_percent_minimum AS landcover_bare_percent_minimum, 
+  landcover_bare_soil_percent_maximum AS landcover_bare_percent_maximum,
+  landcover_bare_soil_percent_average AS landcover_bare_percent_average,
+  landcover_herbaceous_percent_minimum AS landcover_herbs_percent_minimum,
+  landcover_herbaceous_percent_maximum AS landcover_herbs_percent_maximum,
+  landcover_herbaceous_percent_average AS landcover_herbs_percent_average,
+  landcover_trees_percent_minimum,
+  landcover_trees_percent_maximum,
+  landcover_trees_percent_average,
+  ndvi_min_minimum AS landcover_ndvi_minimum,
+  ndvi_max_maximum AS landcover_ndvi_maximum,
+  (ndvi_min_average + ndvi_max_average) / 2 AS landcover_ndvi_average,
+  geo_latitude_average,
+  geo_latitude_range,
+  geo_longitude_average,
+  geo_longitude_range,
+  topography_elevation_minimum,
+  topography_elevation_maximum,
+  topography_elevation_average,
+  topography_elevation_range
+  FROM ecoregions;"
+  )
+```
+
+To read `ecoregions_pairs`:
+
+```{r}
+ecoregions_pairs <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT
+  target_ecoregion AS ecoregion_name,
+  neighbor_ecoregion AS neighbor_name,
+  target_area AS ecoregion_area,
+  neighbor_area,
+  target_ecoregion_climate_aridity_index_average AS ecoregion_climate_aridity_index_average,
+ neighbor_ecoregion_climate_aridity_index_average AS neighbor_climate_aridity_index_average,
+ target_ecoregion_geo_latitude_average AS ecoregion_geo_latitude_average,
+ neighbor_ecoregion_geo_latitude_average AS neighbor_geo_latitude_average,
+  target_ecoregion_geo_longitude_average AS ecoregion_geo_longitude_average,
+ neighbor_ecoregion_geo_longitude_average AS neighbor_geo_longitude_average,
+   target_ecoregion_topography_elevation_average AS ecoregion_topography_elevation_average,
+ neighbor_ecoregion_topography_elevation_average AS neighbor_topography_elevation_average,
+ same_biome AS connection_same_biome,
+ same_realm AS connection_same_realm,
+ same_continent AS connection_same_continent,
+ geographic_distance_km AS connection_distance,
+ connected AS connection_are_neighbors,
+ shared_edge_length AS connection_shared_edge,
+ geo_latitude_diff AS connection_latitude_diff,
+ geo_longitude_diff AS connection_longitude_diff,
+ area_diff AS connection_area_diff,
+ count_species_diff AS richness_species_diff,
+ count_genera_diff AS richness_genera_diff,
+ count_families_diff AS richness_families_diff,
+ count_classes_diff AS richness_classes_diff,
+ count_species_vascular_diff AS richness_species_vascular_diff,
+ count_genera_vascular_diff AS richness_genera_vascular_diff,
+ count_families_vascular_diff AS richness_families_vascular_diff,
+ count_classes_vascular_diff AS richness_classes_vascular_diff,
+ climate_aridity_index_diff,
+ climate_bio1_average_diff,
+ climate_bio4_average_diff,
+ climate_bio5_average_diff,
+ climate_bio12_average_diff,
+ climate_bio15_average_diff,
+ climate_velocity_lgm_average_diff,
+ human_footprint_average_diff,
+ human_population_diff,
+ human_population_density_diff,
+ landcover_bare_soil_percent_average_diff AS landcover_bare_percent_average_diff,
+ landcover_herbaceous_percent_average_diff AS landcover_herbs_percent_average_diff,
+ landcover_trees_percent_average_diff,
+ ndvi_min_diff AS landcover_ndvi_min_diff,
+ ndvi_max_diff AS landcover_ndvi_max_diff,
+ topography_elevation_diff
+ FROM ecoregions_pairs;"
+  )
+```
+
+To read `ecoregions_neighbors`:
+
+```{r}
+ecoregions_neighbors <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT 
+  ecoregion,
+  neighbor
+  FROM ecoregions_neighbors;"
+  )
+```
+
+To read the tables with the species, genera, families and classes identified on each ecoregion.
+
+```{r}
+ecoregions_species  <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT * FROM ecoregions_species;"
+  )
+
+ecoregions_species_taxonomy  <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT * FROM ecoregions_species_taxonomy;"
+  )
+
+ecoregions_genera  <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT * FROM ecoregions_genera;"
+  )
+
+ecoregions_families  <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT * FROM ecoregions_families;"
+  )
+
+ecoregions_classes  <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT * FROM ecoregions_classes;"
+  )
+
+ecoregions_species_vascular  <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT * FROM ecoregions_species_vascular;"
+  )
+
+ecoregions_genera_vascular  <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT * FROM ecoregions_genera_vascular;"
+  )
+
+ecoregions_families_vascular  <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT * FROM ecoregions_families_vascular;"
+  )
+
+ecoregions_classes  <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT * FROM ecoregions_classes_vascular;"
+  )
+
+species <- DBI::dbGetQuery(
+  postgresql.connection, 
+  "SELECT 
+  class,
+  family,
+  genus,
+  species,
+  spatial_records
+  FROM species;"
+  )
+```
+
+##Adding tree species
+
+```{r}
+#loading the tree database from https://tools.bgci.org/global_tree_search.php
+trees <- data.table::fread(
+  "global_tree_search_trees_1_4.csv",
+  header = TRUE)[, 1]
+colnames(trees) <- "species"
+
+#getting unique species in ecoregions_species
+gbif.species <- unique(ecoregions_species$species)
+
+#separating the dataframe in species with the same name in ecoregions_species
+trees.ready <- trees[trees$species %in% gbif.species, ]
+trees.not.ready <- trees[!(trees$species %in% gbif.species), ]
+rm(trees)
+
+#finding gbif synonym for trees in trees.not.ready
+trees.not.ready$synonym <- "none"
+
+for(species.i in trees.not.ready$species){
+  
+  #retrieving synonyms
+  synonyms.i <- rgbif::name_backbone(
+    name = species.i, 
+    kingdom = "Plantae",
+    verbose=TRUE)$data %>% 
+    as.data.frame()
+  
+  #if nothing found
+  if(synonyms.i$matchType == "NONE"){
+    next
+  #if synonyms found  
+  } else {
+    
+    #iterate through synonyms to find them in gbif.species
+    for(synonym.i in synonyms.i[, "canonicalName"]){
+      
+      #chdk if synonym is in gbif.species
+      if(synonym.i %in% gbif.species){
+        
+        #write it in the synonyms column
+        trees.not.ready[
+          trees.not.ready$species == species.i,
+          "synonym"] <- synonym.i
+        
+        #break loop
+        break
+        
+      }
+    }
+  }
+}
+
+#how many species have I salvaged with this
+sum(trees.not.ready$synonym != "none")
+#325...
+
+#preparing to join with trees.ready
+trees.not.ready <- trees.not.ready[
+        trees.not.ready$synonym != "none",
+        "synonym"
+        ]
+colnames(trees.not.ready) <- "species"
+
+#joining with trees.ready
+trees.ready <- rbind(
+  trees.ready,
+  trees.not.ready
+)
+
+#adding boolean column
+trees.ready$is.tree <- TRUE
+
+#adding is.tree to ecoregions_species_taxonomy
+ecoregions_species_taxonomy <- dplyr::left_join(
+  x = ecoregions_species_taxonomy,
+  y = trees.ready,
+  by = "species"
+)
+ecoregions_species_taxonomy[
+  is.na(ecoregions_species_taxonomy$is.tree), 
+  "is.tree"
+  ] <- FALSE
+
+#adding grasses 
+ecoregions_species_taxonomy$is.grass <- FALSE
+ecoregions_species_taxonomy[
+  ecoregions_species_taxonomy$family == "Poaceae",
+  "is.grass"
+  ] <- TRUE
+
+#generating the ecoregions_x tables
+ecoregions_species_trees <- ecoregions_species_taxonomy[
+  ecoregions_species_taxonomy$is.tree == TRUE,
+  c("ecoregion", "species")
+]
+
+ecoregions_genera_trees <- ecoregions_species_taxonomy[
+  ecoregions_species_taxonomy$is.tree == TRUE,
+  c("ecoregion", "genus")
+] %>% 
+  dplyr::distinct()
+
+ecoregions_families_trees <- ecoregions_species_taxonomy[
+  ecoregions_species_taxonomy$is.tree == TRUE,
+  c("ecoregion", "family")
+] %>% 
+  dplyr::distinct()
+
+ecoregions_species_grasses <- ecoregions_species_taxonomy[
+  ecoregions_species_taxonomy$is.grass == TRUE,
+  c("ecoregion", "species")
+]
+
+ecoregions_genera_grasses<- ecoregions_species_taxonomy[
+  ecoregions_species_taxonomy$is.grass == TRUE,
+  c("ecoregion", "genus")
+] %>% 
+  dplyr::distinct()
+```
+
+## Completing the `ecoregions` table
+
+The richness values for trees and grasses need to be added to the `ecoregions` table. First I add the columns.
+
+```{r}
+#adding the columns
+ecoregions <- tibble::add_column(ecoregions, richness_species_trees = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, richness_genera_trees = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, richness_families_trees = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, richness_species_grasses = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, richness_genera_grasses = NA, .before = "neighbors_count")
+```
+
+And then fill them line by line
+
+```{r}
+for(i in 1:nrow(ecoregions)){
+  
+  #getting ecoregion name
+  ecoregion.i <- ecoregions[i, "ecoregion_name"]
+  
+  #filling richness values
+  ecoregions[i, "richness_species_trees"] <- nrow(ecoregions_species_trees[ecoregions_species_trees$ecoregion == ecoregion.i, ])
+  ecoregions[i, "richness_genera_trees"] <- nrow(ecoregions_genera_trees[ecoregions_genera_trees$ecoregion == ecoregion.i, ])
+  ecoregions[i, "richness_families_trees"] <- nrow(ecoregions_families_trees[ecoregions_families_trees$ecoregion == ecoregion.i, ])
+  ecoregions[i, "richness_species_grasses"] <- nrow(ecoregions_species_grasses[ecoregions_species_grasses$ecoregion == ecoregion.i, ])
+  ecoregions[i, "richness_genera_grasses"] <- nrow(ecoregions_genera_grasses[ecoregions_genera_grasses$ecoregion == ecoregion.i, ])
+  
+}
+```
+
+### Assessing the rarity of species, genuses, and families
+
+Species rarity is an important biodiversity dimension.
+
+**Rarity weighted richness** (RWR, Williams et al., 1996)
+
+To compute RWR, species are scored with the inverse of the number of spatial presence records within the *Plantae* dataset, and then the scores of the taxa within each ecoregion are summed. Here I call this index *rwr_species_presence* for species and *rwr_genus_presence* for genuses. This is computed as well as the number of ecoregions (*rwr_species_ecoregions* and *rwr_genus_ecoregions*) and the sum of the area of the ecoregions the species inhabits (*rwr_species_ecoregions_area* and *rwr_genus_ecoregions_area*). 
+
+The index *RWRsp* can be computed by dividing 1 by the column `spatial_records` of the table `species`, that contains the number of spatial records available for each species in the `GBIF Plantae` dataset. The result is then joined onto the table `ecoregions_species`, and the scores summed grouping by `ecoregion`. Finally, the outcome is transferred to the `ecoregions` and `arid_ecoregions` tables.
+
+```{r}
+ecoregions <- tibble::add_column(ecoregions, rarity_species_by_presence = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_species_by_ecoregion = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_species_vascular_by_presence = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_species_vascular_by_ecoregion = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_genera_by_presence = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_genera_by_ecoregion = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_genera_vascular_by_presence = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_genera_vascular_by_ecoregion = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_species_trees_by_presence = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_species_trees_by_ecoregion = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_genera_trees_by_presence = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_genera_trees_by_ecoregion = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_species_grasses_by_presence = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_species_grasses_by_ecoregion = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_genera_grasses_by_presence = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_genera_grasses_by_ecoregion = NA, .before = "neighbors_count")
+```
+
+Then I iterate line by line to compute the rarity of each taxa pool. 
+
+```{r}
+for(i in 1:nrow(ecoregions)){
+  
+  #getting ecoregion name
+  ecoregion.i <- ecoregions[i, "ecoregion_name"]
+
+  #rarity species by presence
+  ecoregions[i, "rarity_species_by_presence"] <- sum(1 / dplyr::left_join(x = ecoregions_species[ecoregions_species$ecoregion == ecoregion.i,], y = species[, c("species", "spatial_records")], by = "species") %>% dplyr::pull(spatial_records))
+  
+    ecoregions[i, "rarity_species_vascular_by_presence"] <- sum(1 / dplyr::left_join(x = ecoregions_species_vascular[ecoregions_species_vascular$ecoregion == ecoregion.i,], y = species[, c("species", "spatial_records")], by = "species") %>% dplyr::pull(spatial_records))
+  
+  #
+  ecoregions[i, "rarity_species_trees_by_presence"] <- sum(1 / dplyr::left_join(x = ecoregions_species_trees[ecoregions_species_trees$ecoregion == ecoregion.i,], y = species[, c("species", "spatial_records")], by = "species") %>% dplyr::pull(spatial_records))
+  
+  #
+  ecoregions[i, "rarity_species_grasses_by_presence"] <- sum(1 / dplyr::left_join(x = ecoregions_species_grasses[ecoregions_species_grasses$ecoregion == ecoregion.i,], y = species[, c("species", "spatial_records")], by = "species") %>% dplyr::pull(spatial_records))
+  
+  #rarity genera by presence
+  #
+  ecoregions[i, "rarity_genera_by_presence"]  <-  sum( 1 / species %>% dplyr::filter(genus %in% ecoregions_genera[ecoregions_genera$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(spatial_records = sum(spatial_records)) %>% dplyr::pull(spatial_records))
+    
+  #
+  ecoregions[i, "rarity_genera_vascular_by_presence"]  <-  sum( 1 / species %>% dplyr::filter(genus %in% ecoregions_genera_vascular[ecoregions_genera_vascular$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(spatial_records = sum(spatial_records)) %>% dplyr::pull(spatial_records))
+    
+  #
+  ecoregions[i, "rarity_genera_trees_by_presence"] <-  sum(1 / species %>% dplyr::filter(genus %in% ecoregions_genera_trees[ecoregions_genera_trees$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(spatial_records = sum(spatial_records)) %>% dplyr::pull(spatial_records))
+    
+  #
+  ecoregions[i, "rarity_genera_grasses_by_presence"] <- sum(1 / species %>% dplyr::filter(genus %in% ecoregions_genera_grasses[ecoregions_genera_grasses$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(spatial_records = sum(spatial_records)) %>% dplyr::pull(spatial_records))
+    
+
+  #rarity species by ecoregion
+  ecoregions[i, "rarity_species_by_ecoregion"] <- sum(1 /
+    ecoregions_species %>% dplyr::filter(species %in% ecoregions_species[ecoregions_species$ecoregion == ecoregion.i, "species"]) %>% dplyr::group_by(species) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+  
+  #
+  ecoregions[i, "rarity_species_vascular_by_ecoregion"] <- sum(1 /
+    ecoregions_species_vascular %>% dplyr::filter(species %in% ecoregions_species_vascular[ecoregions_species_vascular$ecoregion == ecoregion.i, "species"]) %>% dplyr::group_by(species) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+  
+  #
+  ecoregions[i, "rarity_species_trees_by_ecoregion"] <- sum(1 /
+    ecoregions_species_trees %>% dplyr::filter(species %in% ecoregions_species_trees[ecoregions_species_trees$ecoregion == ecoregion.i, "species"]) %>% dplyr::group_by(species) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+  
+  #
+  ecoregions[i, "rarity_species_grasses_by_ecoregion"] <- sum(1 /
+    ecoregions_species_grasses %>% dplyr::filter(species %in% ecoregions_species_grasses[ecoregions_species_grasses$ecoregion == ecoregion.i, "species"]) %>% dplyr::group_by(species) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+
+  #rarity by genus and ecoregion
+  
+  #
+  ecoregions[i, "rarity_genera_by_ecoregion"] <- sum(1 /
+    ecoregions_genera %>% dplyr::filter(genus %in% ecoregions_genera[ecoregions_genera$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+  
+  #
+  ecoregions[i, "rarity_genera_vascular_by_ecoregion"] <- sum(1 /
+    ecoregions_genera_vascular %>% dplyr::filter(genus %in% ecoregions_genera_vascular[ecoregions_genera_vascular$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+  
+  #
+  ecoregions[i, "rarity_genera_trees_by_ecoregion"] <- sum(1 /
+    ecoregions_genera_trees %>% dplyr::filter(genus %in% ecoregions_genera_trees[ecoregions_genera_trees$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+  
+  #
+  ecoregions[i, "rarity_genera_grasses_by_ecoregion"] <-  sum(1 /
+    ecoregions_genera_grasses %>% dplyr::filter(genus %in% ecoregions_genera_grasses[ecoregions_genera_grasses$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+  
+
+}
+```
+
+To compute the percentag of exclusive species, genera, and families...
+
+```{r}
+ecoregions <- tibble::add_column(ecoregions, exclusive_species = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_species_percentage = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_genera = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_genera_percentage = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_species_vascular = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_species_vascular_percentage = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_genera_vascular = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_genera_vascular_percentage = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_species_trees = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_species_trees_percentage = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_genera_trees = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_genera_trees_percentage = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_species_grasses = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_species_grasses_percentage = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_genera_grasses = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, exclusive_genera_grasses_percentage = NA, .before = "neighbors_count")
+```
+
+```{r}
+for(i in 1:nrow(ecoregions)){
+  
+  #getting ecoregion name
+  ecoregion.i <- ecoregions[i, "ecoregion_name"]
+
+  #number and percentage of exclusive species
+  ecoregions[i, "exclusive_species"] <- sum(table(ecoregions_species$species[ecoregions_species$species %in% ecoregions_species[ecoregions_species$ecoregion == ecoregion.i, "species"]]) == 1)
+  
+  ecoregions[i, "exclusive_species_percentage"] <- (ecoregions[i, "exclusive_species"] * 100) / ecoregions[i, "richness_species"]
+  
+  #number and percentage of exclusive genera
+  ecoregions[i, "exclusive_genera"] <- sum(table(ecoregions_genera$genus[ecoregions_genera$genus %in% ecoregions_genera[ecoregions_genera$ecoregion == ecoregion.i, "genus"]]) == 1)
+  
+  ecoregions[i, "exclusive_genera_percentage"] <- (ecoregions[i, "exclusive_genera"] * 100) / ecoregions[i, "richness_genera"]
+  
+  #number and percentage of exclusive vascular species
+  ecoregions[i, "exclusive_species_vascular"] <- sum(table(ecoregions_species_vascular$species[ecoregions_species_vascular$species %in% ecoregions_species_vascular[ecoregions_species_vascular$ecoregion == ecoregion.i, "species"]]) == 1)
+  
+  ecoregions[i, "exclusive_species_vascular_percentage"] <- (ecoregions[i, "exclusive_species_vascular"] * 100) / ecoregions[i, "richness_species_vascular"]
+  
+    #number and percentage of exclusive vascular genera
+  ecoregions[i, "exclusive_genera_vascular"] <- sum(table(ecoregions_genera_vascular$genus[ecoregions_genera_vascular$genus %in% ecoregions_genera_vascular[ecoregions_genera_vascular$ecoregion == ecoregion.i, "genus"]]) == 1)
+  
+  ecoregions[i, "exclusive_genera_vascular_percentage"] <- (ecoregions[i, "exclusive_genera_vascular"] * 100) / ecoregions[i, "richness_genera"]
+  
+  #number and percentage of exclusive tree species
+  ecoregions[i, "exclusive_species_trees"] <- sum(table(ecoregions_species_trees$species[ecoregions_species_trees$species %in% ecoregions_species_trees[ecoregions_species_trees$ecoregion == ecoregion.i, "species"]]) == 1)
+  
+  ecoregions[i, "exclusive_species_trees_percentage"] <- (ecoregions[i, "exclusive_species_trees"] * 100) / ecoregions[i, "richness_species_trees"]
+  
+  #number and percentage of exclusive tree genera
+  ecoregions[i, "exclusive_genera_trees"] <- sum(table(ecoregions_genera_trees$genus[ecoregions_genera_trees$genus %in% ecoregions_genera_trees[ecoregions_genera_trees$ecoregion == ecoregion.i, "genus"]]) == 1)
+  
+  ecoregions[i, "exclusive_genera_trees_percentage"] <- (ecoregions[i, "exclusive_genera_trees"] * 100) / ecoregions[i, "richness_genera_trees"]
+  
+    #number and percentage of exclusive grasses species
+  ecoregions[i, "exclusive_species_grasses"] <- sum(table(ecoregions_species_grasses$species[ecoregions_species_grasses$species %in% ecoregions_species_grasses[ecoregions_species_grasses$ecoregion == ecoregion.i, "species"]]) == 1)
+  
+  ecoregions[i, "exclusive_species_grasses_percentage"] <- (ecoregions[i, "exclusive_species_grasses"] * 100) / ecoregions[i, "richness_species_grasses"]
+  
+    #number and percentage of exclusive grasses genera
+  ecoregions[i, "exclusive_genera_grasses"] <- sum(table(ecoregions_genera_grasses$genus[ecoregions_genera_grasses$genus %in% ecoregions_genera_grasses[ecoregions_genera_grasses$ecoregion == ecoregion.i, "genus"]]) == 1)
+  
+  ecoregions[i, "exclusive_genera_grasses_percentage"] <- (ecoregions[i, "exclusive_genera_grasses"] * 100) / ecoregions[i, "richness_genera_grasses"]
+  
+  
+}
+```
+
+
+The habitat fragmentation measures computed above have to be added to the table `ecoregions`.
+Also, there are a few data gaps in the `ecoregions` table, particularly for these ecoregions that do not have direct neighbors.
+
+
+```{r}
+#loading fragmentation data
+load("fragmentation_ecoregions.RData")
+
+#joining it with the ecoregions table
+ecoregions <-
+  ecoregions %>% 
+  dplyr::left_join(
+  y = fragmentation_ecoregions,
+  by = c("ecoregion_name" = "ecoregion")
+)
+
+
+rm(fragmentation_ecoregions)
+```
+
+The table ecoregions also has gaps in the `neighbors_x` fields for these ecoregions that have no direct neighbors because they are surrounded by the ocean. Here, to fill these gaps, I replace direct neighbors with neighboring ecoregions that are at a distance of 1000 km or less.
+
+The fields to fill are:
+
+  + `neighbors_count`
+  + `neighbors_area`
+  + `neighbors_percentage_shared_edge` (must be set to 0)
+  + `neighbors_average_aridity`
+  + `neighbors_species_count_average`
+  + `neighbors_genera_count_average`
+  + `neighbors_families_count_average`
+  + `neighbors_classes_count_average`
+  
+Below I iterate through each record in `ecoregions`, and for each record with `NA` in `neighbors_count` I retrieve the neighboring ecoregions within 1000 km to compute and fill the missing values. I take advantage of this loop to add to each ecoregion its environmental hypervolume, stored in *hypervolumes_ecoregions.RData*
+
+```{r}
+#loading hypervolumes
+load("hypervolumes_ecoregions.RData")
+
+#creating hypervolume
+ecoregions$climate_hypervolume <- NA
+
+#iterating through ecoregions
+for(i in 1:nrow(ecoregions)){
+  
+  #getting ecoregion name
+  ecoregion.i <- ecoregions[i, "ecoregion_name"]
+  
+  #adding climate hypervolume
+  if(ecoregion.i %in% names(hypervolumes_ecoregions)){
+    ecoregions[i, "climate_hypervolume"] <- hypervolume::get_volume(hypervolumes_ecoregions[[ecoregion.i]])
+  }
+  
+  #if there are gaps to fill
+  if(is.na(ecoregions[i, "neighbors_count"])){
+    
+    #retrieving neighbors 
+    neighbors.i <- dplyr::filter(
+      ecoregions_pairs,
+      ecoregion_name == ecoregion.i,
+      connection_distance <= 1000
+    ) %>% 
+      dplyr::pull(neighbor_name)
+    
+    #next if empty
+    if(length(neighbors.i) == 0){next}
+    
+    #indices of rows in ecoregions
+    indices.i <- which(ecoregions$ecoregion_name %in% neighbors.i)
+    
+    #filling empty columns
+   ecoregions[i, "neighbors_count"] <- length(neighbors.i)
+
+   ecoregions[i, "neighbors_area"] <- sum(ecoregions[
+     indices.i,
+     "ecoregion_area_km2"
+   ])
+
+   ecoregions[i, "neighbors_percentage_shared_edge"] <- 0
+     
+   ecoregions[i, "neighbors_average_aridity"] <- mean(ecoregions[
+     indices.i,
+     "climate_aridity_index_average"
+   ])
+     
+   ecoregions[i, "neighbors_species_count_average"] <- mean(ecoregions[
+     indices.i,
+     "richness_species"
+   ])
+   
+   ecoregions[i, "neighbors_genera_count_average"] <- mean(ecoregions[
+     indices.i,
+     "richness_genera"
+   ])
+   
+   ecoregions[i, "neighbors_families_count_average"] <- mean(ecoregions[
+     indices.i,
+     "richness_families"
+   ])
+   
+  ecoregions[i, "neighbors_classes_count_average"] <- mean(ecoregions[
+     indices.i,
+     "richness_classes"
+   ])
+
+  } else {
+    next
+  }
+  
+}
+```
+
+## Computation of betadiversity scores
+
+For the table `ecoregions` I compute betadiversity between each ecoregion and its immediate neighbors.
+
+To exemplify how to compute betadiversity scores here I take two neighboring ecoregions: "North Western Ghats moist deciduous forests" (`eco1`) and "South Deccan Plateau dry deciduous forests" (`eco2`).
+
+I first compute `a` as the the number of species common both sites, whereas `b` and `c`, respectively, are the number of exclusive species of each site.
+
+```{r}
+#retrieving species of each ecoregion
+eco1 <- ecoregions_species[ecoregions_species$ecoregion == "North Western Ghats moist deciduous forests", "species"]
+eco2 <- ecoregions_species[ecoregions_species$ecoregion == "South Deccan Plateau dry deciduous forests", "species"]
+
+#number of species of each site
+length(eco1)
+length(eco2)
+
+#extracting betadiversity components
+a <- length(intersect(eco1, eco2))
+b <- length(setdiff(eco1, eco2))
+c <- length(setdiff(eco2, eco1))
+
+#betadiversity components as percentage of the species pool
+a. <- (a * 100) / (a + b + c)
+b. <- (b * 100) / (a + b + c)
+c. <- (c * 100) / (a + b + c)
+```
+
+There is a large number of betadiversity measures. Here I use four compute:
+
+**COPIED FROM BENITO ET AL. 2013**
+We examined Koleff, Gaston & Lennon (2003) searching for indexes with different properties and selected two of them: (1) the Sorensen similarity index (bsor), presented by Lennon et al. (2001), is a measure of continuity that depends on the variation of the matching component a. To allow the comparison of bsor with the other indexes, we transformed its values into dissimilarity by subtracting the equation in Koleff, Gaston & Lennon (2003) by one (see Eq. 3). According to Eq. 3, bsor has its upper limit at one (strong dissimilarity between compositions) and the lower limit at zero (strong similarity between compositions); (2) the symmetric form of the Simpson’s dissimilarity index (bsim, Eq. 4), that was also presented in Lennon et al. (2001), derived from the one proposed by Simpson (1943), and reformulated by Koleff, Gaston & Lennon (2003). bsim is a measure of turnover focused on compositional differences instead of differences in species richness. The upper bsim value is found when the observed and predicted compositions have no species in common, and the lower value is zero, when both compositions are the same.
+
+  + **Richness similarity**, computed as $R = |(a + b) - (a + c)|$ for the raw version, and $R. = |(a. + b.) - (a. + c.)|$ for the percentage version.
+  + **Composition similarity**, computed as $C = (b + c) / a$ for the raw species numbers. Not computed for species percentages because it yields the same result.
+  + **Sorensen similarity index** (Lennon et al. 2001), computed as $Bsor = 1 - (2a / (2a + b + c))$ for the raw numbers, and not computed for the species percentages.
+  + **Simpson's dissimilarity index** (Lennon et al. 2001), computed as $Bsim = min(b, c) / (min(b, c) + a)$ for the raw numbers only (yields same result with percentages of the total species pool.)
+  
+```{r}
+#richness similarity
+R <- abs((a + b) - (a + c))
+R. <- abs((a. + b.) - (a. + c.))
+
+#composition similarity
+C <- (b + c) / a
+
+#Sorensen similarity index
+Bsor <- 1 - (2 * a / (2 * a + b + c))
+
+#Simpson's similarity index
+Bsim <- min(b, c) / (min(b, c) + a)
+```
+
+The custom function `betadiversity()` performs the computation for any given pair of ecoregions, as follows:
+
+```{r}
+x <- betadiversity(
+  ecoregion.1 = "North Western Ghats moist deciduous forests",
+  ecoregion.2 = "South Deccan Plateau dry deciduous forests",
+  taxa.list = ecoregions_species,
+  taxa.column = "species"
+)
+x
+```
+The same can be done between an ecoregion and a group of ecoregions and different taxonomic levels.
+
+```{r}
+x <- betadiversity(
+  ecoregion.1 = "Central Deccan Plateau dry deciduous forests",
+  ecoregion.2 = c(
+    "South Deccan Plateau dry deciduous forests",
+    "North Western Ghats moist deciduous forests"
+    ),
+  taxa.list = ecoregions_genera,
+  taxa.column = "genus"
+)
+x
+```
+To evaluate betadiversity (for species, genera, and family levels) between each ecoregion in `ecoregions` and its direct neighbors I first create a new set of columns in `ecoregions`.
+
+```{r}
+#names of betadiversity components
+betadiversity.components <- c(
+  "a", 
+  "b", 
+  "c", 
+  "a_percent", 
+  "b_percent", 
+  "c_percent", 
+  "R", 
+  "R_percent", 
+  "C", 
+  "Bsor", 
+  "Bsim")
+
+#vector of new columns
+betadiversity.columns <- c(
+  paste(
+    "betadiversity_species", 
+    betadiversity.components,
+    sep = "_"
+  ),
+  paste(
+    "betadiversity_genera", 
+    betadiversity.components,
+    sep = "_"
+  ),
+  paste(
+    "betadiversity_families", 
+    betadiversity.components,
+    sep = "_"
+  ),
+  paste(
+    "betadiversity_species_vascular", 
+    betadiversity.components,
+    sep = "_"
+  ),
+  paste(
+    "betadiversity_genera_vascular", 
+    betadiversity.components,
+    sep = "_"
+  ),
+  paste(
+    "betadiversity_families_vascular", 
+    betadiversity.components,
+    sep = "_"
+  ),
+  paste(
+    "betadiversity_species_trees", 
+    betadiversity.components,
+    sep = "_"
+  ),
+  paste(
+    "betadiversity_genera_trees", 
+    betadiversity.components,
+    sep = "_"
+  ),
+  paste(
+    "betadiversity_families_trees", 
+    betadiversity.components,
+    sep = "_"
+  ),
+    paste(
+    "betadiversity_species_grasses", 
+    betadiversity.components,
+    sep = "_"
+  ),
+  paste(
+    "betadiversity_genera_grasses", 
+    betadiversity.components,
+    sep = "_"
+  )
+  )
+
+#creating the columns in the dataframe
+for(betadiversity.column in betadiversity.columns){
+  ecoregions[, betadiversity.column] <- NA
+}
+
+rm(betadiversity.column)
+```
+
+To fill these new columns I iterate through ecoregions in `ecoregions`, retrieve their respective neighbors from `ecoregions_neighbors` and apply the function `betadiversity` three times, using `ecoregions_species`, `ecoregions_genera` and `ecoregions_families` as `taxa.list` in the function. If an ecoregion has no neighbors, it's three closest neighbors are selected instead from `ecoregions_pairs`.
+
+```{r}
+#iterating through ecoregions
+for(ecoregion.i in ecoregions$ecoregion_name){
+  
+  #gathering neighbor names
+  neighbors.i <- ecoregions_neighbors[
+    ecoregions_neighbors$ecoregion == ecoregion.i, 
+    "neighbor"
+    ]
+  
+  #if it has no neighbors
+  if(length(neighbors.i) == 0){
+        
+    #retrieving neighbors whithin 1000km
+    neighbors.i <- dplyr::filter(
+      ecoregions_pairs,
+      ecoregion_name == ecoregion.i,
+      connection_distance <= 1000
+    ) %>% 
+      dplyr::pull(neighbor_name)
+    
+  }
+  
+  #if again, there are no neighbors, jump to next
+  if(length(neighbors.i) == 0){next}
+  
+  #computing betadiversity for species
+  betadiversity.species.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbors.i,
+    taxa.list = ecoregions_species,
+    taxa.column = "species"
+  )
+  
+  #for genera
+  betadiversity.genera.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbors.i,
+    taxa.list = ecoregions_genera,
+    taxa.column = "genus"
+  )
+  
+  #for family
+  betadiversity.families.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbors.i,
+    taxa.list = ecoregions_families,
+    taxa.column = "family"
+  )
+  
+  #computing vascular
+  betadiversity.species.vascular.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbors.i,
+    taxa.list = ecoregions_species_vascular,
+    taxa.column = "species"
+  )
+  
+  #for genera
+  betadiversity.genera.vascular.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbors.i,
+    taxa.list = ecoregions_genera_vascular,
+    taxa.column = "genus"
+  )
+  
+  #for family
+  betadiversity.families.vascular.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbors.i,
+    taxa.list = ecoregions_families_vascular,
+    taxa.column = "family"
+  )
+  
+   #computing vascular
+  betadiversity.species.trees.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbors.i,
+    taxa.list = ecoregions_species_trees,
+    taxa.column = "species"
+  )
+  
+  #for genera
+  betadiversity.genera.trees.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbors.i,
+    taxa.list = ecoregions_genera_trees,
+    taxa.column = "genus"
+  )
+  
+  #for family
+  betadiversity.families.trees.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbors.i,
+    taxa.list = ecoregions_families_trees,
+    taxa.column = "family"
+  )
+  
+  #computing vascular
+  betadiversity.species.grasses.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbors.i,
+    taxa.list = ecoregions_species_grasses,
+    taxa.column = "species"
+  )
+  
+  #for genera
+  betadiversity.genera.grasses.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbors.i,
+    taxa.list = ecoregions_genera_grasses,
+    taxa.column = "genus"
+  )
+  
+  #writing results to dataframe
+  ecoregions[
+    ecoregions$ecoregion_name == ecoregion.i,
+    betadiversity.columns] <- c(
+      betadiversity.species.i,
+      betadiversity.genera.i,
+      betadiversity.families.i,
+      betadiversity.species.vascular.i,
+      betadiversity.genera.vascular.i,
+      betadiversity.families.vascular.i,
+      betadiversity.species.trees.i,
+      betadiversity.genera.trees.i,
+      betadiversity.families.trees.i,
+      betadiversity.species.grasses.i,
+      betadiversity.genera.grasses.i
+    )
+  
+}
+```
+
+
+To finally get this table ready, I remove all rows with NA, that correspond with ecoregions with an area lower than 10000 squared kilometers, or ecoregions thar are isolated by the ocean.
+
+```{r}
+ecoregions <- na.omit(ecoregions)
+```
+
+With the table `ecoregions_pairs` there are still several operations to do.
+
+First, I remove from the fields `ecoregion_name` and `neighbor_name` every row with an ecoregion not available in `ecoregions$ecoregion_name`.
+
+```{r}
+#actually, there are no rows to remove
+ecoregions_pairs <- dplyr::filter(
+  ecoregions_pairs,
+  ecoregion_name %in% ecoregions$ecoregion_name,
+  neighbor_name %in% ecoregions$ecoregion_name
+)
+```
+
+The table `ecoregions_pairs` requires, as `ecoregions`, a set of columns with the betadiversity between ecoregion pairs, and a measure of environmental overlap generated from the n-dimensional envelopes built with the package `hypervolume` and stored in the object *hypervolumes_ecoregions.RData*. 
+
+First we add the betadiversity columns, as done before with `ecoregions`, and the column `environmental_overlap`.
+
+```{r}
+#creating the columns in the dataframe
+for(betadiversity.column in betadiversity.columns){
+  ecoregions_pairs[, betadiversity.column] <- NA
+}
+
+#adding environmental overlap
+environmental.overlap.columns  <- c(
+  "environmental_overlap_jaccard",
+  "environmental_overlap_sorensen",
+  "environmental_overlap_frac_unique_ecoregion",
+  "environmental_overlap_frac_unique_neighbor"
+)
+for(environmental.overlap.column in environmental.overlap.columns){
+  ecoregions_pairs[, environmental.overlap.column] <- NA
+}
+
+rm(betadiversity.column, environmental.overlap.column)
+```
+
+I fill these new columns by iterating record by record.
+
+```{r, message=FALSE, warning=FALSE}
+for(i in 1:nrow(ecoregions_pairs)){
+  
+  #getting names
+  ecoregion.i <- ecoregions_pairs[i, "ecoregion_name"]
+  neighbor.i <- ecoregions_pairs[i, "neighbor_name"]
+  
+  #computing betadiversity for species
+  betadiversity.species.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbor.i,
+    taxa.list = ecoregions_species,
+    taxa.column = "species"
+  )
+  
+  #for genera
+  betadiversity.genera.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbor.i,
+    taxa.list = ecoregions_genera,
+    taxa.column = "genus"
+  )
+  
+  #for family
+  betadiversity.families.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbor.i,
+    taxa.list = ecoregions_families,
+    taxa.column = "family"
+  )
+  
+  #computing betadiversity for vascular species
+  betadiversity.species.vascular.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbor.i,
+    taxa.list = ecoregions_species_vascular,
+    taxa.column = "species"
+  )
+  
+  #for genera
+  betadiversity.genera.vascular.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbor.i,
+    taxa.list = ecoregions_genera_vascular,
+    taxa.column = "genus"
+  )
+  
+  #for family
+  betadiversity.families.vascular.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbor.i,
+    taxa.list = ecoregions_families_vascular,
+    taxa.column = "family"
+  )
+  
+    #computing betadiversity for vascular species
+  betadiversity.species.trees.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbor.i,
+    taxa.list = ecoregions_species_trees,
+    taxa.column = "species"
+  )
+  
+  #for genera
+  betadiversity.genera.trees.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbor.i,
+    taxa.list = ecoregions_genera_trees,
+    taxa.column = "genus"
+  )
+  
+  #for family
+  betadiversity.families.trees.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbor.i,
+    taxa.list = ecoregions_families_trees,
+    taxa.column = "family"
+  )
+  
+  #computing betadiversity for vascular species
+  betadiversity.species.grasses.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbor.i,
+    taxa.list = ecoregions_species_grasses,
+    taxa.column = "species"
+  )
+  
+  #for genera
+  betadiversity.genera.grasses.i <- betadiversity(
+    ecoregion.1 = ecoregion.i,
+    ecoregion.2 = neighbor.i,
+    taxa.list = ecoregions_genera_grasses,
+    taxa.column = "genus"
+  )
+  
+  #writing results to dataframe
+  ecoregions_pairs[
+    i,
+    betadiversity.columns] <- c(
+      betadiversity.species.i,
+      betadiversity.genera.i,
+      betadiversity.families.i,
+      betadiversity.species.vascular.i,
+      betadiversity.genera.vascular.i,
+      betadiversity.families.vascular.i,
+      betadiversity.species.trees.i,
+      betadiversity.genera.trees.i,
+      betadiversity.families.trees.i,
+      betadiversity.species.grasses.i,
+      betadiversity.genera.grasses.i
+    )
+  
+  #computing environmental overlap
+  hv.set.i <- hypervolume::hypervolume_set(
+  hv1 = hypervolumes_ecoregions[[ecoregion.i]],
+  hv2 = hypervolumes_ecoregions[[neighbor.i]],
+  check.memory = FALSE
+  )
+  
+  #environmental overlap
+  ecoregions_pairs[
+    i,
+    environmental.overlap.columns
+    ] <-suppressMessages(hypervolume::hypervolume_overlap_statistics(hvlist = hv.set.i))
+  
+}
+```
+
+```{r}
+save(ecoregions, ecoregions_pairs, file = "ecoregions_data.RData")
+```
 
 
 # References
 
 Olson, D. M., Dinerstein, E., Wikramanayake, E. D., Burgess, N. D., Powell, G. V. N., Underwood, E. C., D'Amico, J. A., Itoua, I., Strand, H. E., Morrison, J. C., Loucks, C. J., Allnutt, T. F., Ricketts, T. H., Kura, Y., Lamoreux, J. F., Wettengel, W. W., Hedao, P., Kassem, K. R. 2001. Terrestrial ecoregions of the world: a new map of life on Earth. Bioscience 51(11):933-938.
+
+Hesselbarth, M.H.K., Sciaini, M., With, K.A., Wiegand, K., Nowosad, J. 2019. landscapemetrics: an open‐source R tool to calculate landscape metrics. Ecography, 42: 1648-1657 (ver. 0). 
+
+Lennon, J.J.,Koleff, P., Greenwood, J.J.D. &Gaston, K.J. (2001) The geographical
+structure of British bird distributions,Diversity, spatial turnover and scale.
+Journal of Animal Ecology, 70, 966–979.

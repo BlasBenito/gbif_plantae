@@ -409,7 +409,49 @@ r.mask raster=propagated_nulls@ecoregions
 #removing propagated_nulls
 g.remove -f type=raster name=propagated_nulls@ecoregions
 
+#aridity levels
+#creating integer map
+r.mapcalc "climate_aridity_index_integer = int(climate_aridity_index * 100)"
+
+r.reclass input=climate_aridity_index_integer@ecoregions output=climate_aridity_index_levels rules=/media/workshop/GRASSDB/ENVIRONMENTAL_VARIABLES/ecoregions/.tmp/x-wing/12914.1
+
+#rules
+95 thru 100 = 1 hyperarid
+80 thru 95 = 2 arid
+50 thru 80= 3 semiarid
+44 thru 50 = 4 dry subhumid
+35 thru 44 = 5 humid
+-900 thru 35 = 6 hyperhumid
+
+#reclass table to map
+r.mapcalc "climate_aridity_index_levels = int(climate_aridity_index_levels)" --overwrite
+
+#managing categories AGAIN...
+r.category map=climate_aridity_index_levels@ecoregions separator=comma rules=/media/workshop/GRASSDB/ENVIRONMENTAL_VARIABLES/ecoregions/.tmp/x-wing/12914.2
+1,hyperarid
+2,arid
+3,semiarid
+4,dry subhumid
+5,humid
+6,hyperhumid
+
+
+#to vector
+r.to.vect -v --overwrite input=climate_aridity_index_levels@ecoregions output=climate_aridity_index_levels type=area column=aridity_level
+
+#simplifying the vector map
+v.generalize --overwrite input=climate_aridity_index_levels@ecoregions type=area output=climate_aridity_index_levels_simplified method=sliding_averaging threshold=0.1
+
+#rebuilding topology
+v.build map=climate_aridity_index_levels_simplified@ecoregions
+
+#export to postgis database
+v.out.postgis input=climate_aridity_index_levels_simplified@ecoregions output=PG:dbname=flora_ecoregions output_layer=aridity_levels options='GEOMETRY_NAME=geom'
+
+
 #exporting maps to tif
+r.out.gdal input=climate_aridity_index_levels@ecoregions output=/media/workshop/geotif/climate_aridity_index_levels.tif format=GTiff
+
 r.out.gdal input=climate_annual_PET@ecoregions output=/media/workshop/geotif/climate_annual_PET.tif format=GTiff
 
 r.out.gdal input=climate_PET_driest_quarter@ecoregions output=/media/workshop/geotif/climate_PET_driest_quarter.tif format=GTiff
