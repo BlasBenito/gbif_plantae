@@ -1,0 +1,149 @@
+---
+title: "Niche overlap analysis with the package hypervolume"
+output: html_notebook
+---
+
+Installing packages and loading functions
+
+```{r}
+#automatic install of packages if they are not readily available
+list.of.packages <- c(
+  "tidyverse", 
+  "hypervolume"
+  )
+
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+
+#installing packages not in the system
+if(length(new.packages) > 0){
+  install.packages(new.packages, dep=TRUE)
+}
+
+#loading packages
+for(package.i in list.of.packages){
+  library(package.i, character.only = TRUE)
+}
+
+#loading functions
+source("niche_overlap_functions.R")
+
+#removing scientific notation
+options(scipen = 9999)
+```
+
+Loading data for analysis
+
+```{r}
+#read your data as you need to.
+df <- ...
+```
+
+Vector with predictor names. Having a vector with the names of your predictors is useful for subsetting operations.
+
+```{r}
+predictors <- c("...", "...", "...")
+```
+
+Scaling the data. This is important, because the niche dimensions need to be normalized, but for both datasets at once, so the niche dimensions in both datasets have the same scaling properties.
+
+```{r}
+df.scaled <- data.frame(
+  groups = df$your.grouping.variable,
+  as.data.frame(scale(df[, predictors]))
+)
+```
+
+Assessing multicollinearity in the dataset. The niche overlap analysis has two simple requirements: the variables should not be correlated, and the number of dimensions should be as limited as possible. 3 to 6 dimensions is ideal. Here, to select the variables I use the custom function `auto_vif()` that I wrote for an SDM package that is unpublished yet. It applies a *variance inflation factor* analysis to your predictors, but lets you order the predictors so it gives preference to the ones you find more suitable/important to explain the distribution of your groups. I included the help file of the function in the file `niche_overlap_functions` in case you want to give it a read.
+
+**NOTE:** You can surely use any other method you find suitable to limit multicollinearity in your data, I used this one here because it's the one I am using in my own work right now.
+
+```{r}
+variable.selection <- s_lower_vif(
+  training.df = df.scaled,
+  preference.order = c(#prioritise by how well you can explain the link between the variable and your groups
+    "...",
+    "...",
+    "...",
+    "..."
+    ),
+  omit.cols = c(
+    "your.grouping.variable", #for columns that are not predictors
+    "...", 
+    "..." 
+    )
+  )
+variable.selection
+
+#the uncorrelated variables are in
+variable.selection$vars
+```
+
+Separating your data in groups. The hypervolume functions to compute hypervolumes require data on one group alone.
+
+```{r}
+df.a <- df.scaled[df.scaled$your.grouping.variable == "group_a", variable.selection$vars]
+df.b <- df.scaled[df.scaled$your.grouping.variable == "group_b", variable.selection$vars]
+```
+
+Computing hypervolumes. The function `hypervolume::hypervolume_svm()` is the one that uses the simplest way to define the hypervolume of an input dataset. However, the drawback of this function is that it scales the data AGAIN without giving the user the opportunity to turn this option off, meaning that at the end, the hypervolumes to compare have an unquantifiable offset from each other due to separated scaling. I have solved this by rewriting the function and naming it `hypervolume_svm_()`, that takes the data as it is provided by the user.
+
+Hypervolume of the group "a"
+
+```{r}
+hv.a <- hypervolume_svm_(
+  data = df.a,
+  name = "a"
+)
+plot(hv.a)
+```
+
+Hypervolume of the group "b"
+
+```{r}
+hv.b <- hypervolume_svm_(
+  data = df.b,
+  name = "b"
+)
+plot(hv.b)
+```
+
+The total n-dimensional volume of each hypervolume can be computed with `hypervolume::get_volume()`
+
+```{r}
+hypervolume::get_volume(hv.a)
+hypervolume::get_volume(hv.b)
+```
+
+Notice that the hypervolumes you computed can be used as an SDM when projected onto your raster files with `hypervolume_project()`. The advantage of SDMs based on hypervolumes is that they don't need pseudo-absences or background data (comprehensive sampling of available environmental conditions) to fit the model, and therefore they remove one whole conceptual stage of the modelling process that can induce unknown biases.
+
+```{r}
+sdm.a <- hypervolume_project(hv = hv.a, rasters = your.rasters, type = "probability", verbose = TRUE)
+sdm.b <- hypervolume_project(hv = hv.b, rasters = your.rasters, type = "probability", verbose = TRUE)
+```
+
+To compute the overlap of the hypervolumes, they have to be put together in a "set".
+
+```{r}
+hv.set <- hypervolume::hypervolume_set(
+  hv1 = hv.a,
+  hv2 = hv.b,
+  check.memory = FALSE
+)
+```
+
+And finally, we can compute the overlap with `hypervolume_overlap_statistics()`
+
+```{r}
+hv.overlap <- hypervolume::hypervolume_overlap_statistics(hvlist = hv.set)
+hv.overlap
+```
+
+The outcome offers four statistics, that according the help of `hypervolume_overlap_statistics()`:
+
+  + jaccard: Jaccard similarity (volume of intersection of 1 and 2 divided by volume of union of 1 and 2)
+
+  + sorensen: Sorensen similarity (twice the volume of intersection of 1 and 2 divided by volume of 1 plus volume of 2)
+
+  + frac_unique_1: Unique fraction 1 (volume of unique component of 1 divided by volume of 1))
+
+  + frac_unique_2: Unique fraction 2 (volume of unique component of 2 divided by volume of 2))

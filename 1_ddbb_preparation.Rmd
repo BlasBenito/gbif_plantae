@@ -64,6 +64,7 @@ list.of.packages <- c(
   "rpostgis",
   "readr",
   "sp",
+  "sf",
   "raster",
   "tidyverse",
   "hypervolume",
@@ -93,6 +94,7 @@ library(hypervolume)
 library(landscapemetrics)
 library(rgbif)
 library(tibble)
+library(sf)
 
 #loading functions
 source("functions.R")
@@ -2061,9 +2063,7 @@ FROM ecoregions_neighbors
 ORDER BY ecoregion;
 ```
 
-## Computing betadiversity scores between ecoregions
-
-To compute betadiversity scores I first load the required tables into the R environment. In this step I will change the names of several columns to better represent the underlying structure of the data.
+## Loading data from the PostgreSQL database
 
 ```{r}
 ecoregions <- DBI::dbGetQuery(
@@ -2076,8 +2076,8 @@ ecoregions <- DBI::dbGetQuery(
   area AS ecoregion_area_km2,
   count_records AS bias_records,
   records_per_km2 AS bias_records_per_km2,
-  count_species / count_records AS bias_species_per_record,
-  count_species / records_per_km2 AS bias_species_per_record_per_km2,
+  count_species::numeric / count_records AS bias_species_per_record,
+  (count_species::numeric / count_records) / records_per_km2 AS bias_species_per_record_per_km2,
   count_species AS richness_species,
   count_genera AS richness_genera,
   count_families AS richness_families,
@@ -2149,6 +2149,16 @@ ecoregions <- DBI::dbGetQuery(
   )
 ```
 
+Removing "Rock and ice" from `ecoregions`.
+
+```{r}
+ecoregions <- dplyr::filter(
+  ecoregions,
+  ecoregion_name != "Rock and Ice"
+)
+```
+
+
 To read `ecoregions_pairs`:
 
 ```{r}
@@ -2214,6 +2224,16 @@ ecoregions_neighbors <- DBI::dbGetQuery(
   neighbor
   FROM ecoregions_neighbors;"
   )
+```
+
+Removing "Rock and Ice" from `ecoregions_neighbors`.
+
+```{r}
+ecoregions_neighbors <- dplyr::filter(
+  ecoregions_neighbors,
+  ecoregion != "Rock and Ice",
+  neighbor != "Rock and Ice"
+)
 ```
 
 To read the tables with the species, genera, families and classes identified on each ecoregion.
@@ -2398,6 +2418,52 @@ ecoregions_genera_grasses<- ecoregions_species_taxonomy[
   dplyr::distinct()
 ```
 
+Writing `ecoregions_species_taxonomy`, `ecoregions_species_trees`, `ecoregions_genera_trees`, `ecoregions_families_trees` ,`ecoregions_species_grasses`, and `ecoregions_genera_grasses` back to the database.
+
+```{r}
+RPostgreSQL::dbSendQuery(
+  conn = postgresql.connection,
+  statement = "DROP TABLE ecoregions_species_taxonomy;"
+)
+
+RPostgreSQL::dbWriteTable(
+  conn = postgresql.connection,
+  name = "ecoregions_species_taxonomy",
+  value = ecoregions_species_taxonomy
+)
+
+RPostgreSQL::dbWriteTable(
+  conn = postgresql.connection,
+  name = "ecoregions_species_trees",
+  value = ecoregions_species_trees
+)
+
+RPostgreSQL::dbWriteTable(
+  conn = postgresql.connection,
+  name = "ecoregions_genera_trees",
+  value = ecoregions_genera_trees
+)
+
+RPostgreSQL::dbWriteTable(
+  conn = postgresql.connection,
+  name = "ecoregions_families_trees",
+  value = ecoregions_families_trees
+)
+
+RPostgreSQL::dbWriteTable(
+  conn = postgresql.connection,
+  name = "ecoregions_species_grasses",
+  value = ecoregions_species_grasses
+)
+
+RPostgreSQL::dbWriteTable(
+  conn = postgresql.connection,
+  name = "ecoregions_genera_grasses",
+  value = ecoregions_genera_grasses
+)
+```
+
+
 ## Completing the `ecoregions` table
 
 The richness values for trees and grasses need to be added to the `ecoregions` table. First I add the columns.
@@ -2440,22 +2506,23 @@ To compute RWR, species are scored with the inverse of the number of spatial pre
 The index *RWRsp* can be computed by dividing 1 by the column `spatial_records` of the table `species`, that contains the number of spatial records available for each species in the `GBIF Plantae` dataset. The result is then joined onto the table `ecoregions_species`, and the scores summed grouping by `ecoregion`. Finally, the outcome is transferred to the `ecoregions` and `arid_ecoregions` tables.
 
 ```{r}
-ecoregions <- tibble::add_column(ecoregions, rarity_species_by_presence = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_species_by_ecoregion = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_species_vascular_by_presence = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_species_vascular_by_ecoregion = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_genera_by_presence = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_genera_by_ecoregion = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_genera_vascular_by_presence = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_genera_vascular_by_ecoregion = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_species_trees_by_presence = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_species_trees_by_ecoregion = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_genera_trees_by_presence = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_genera_trees_by_ecoregion = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_species_grasses_by_presence = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_species_grasses_by_ecoregion = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_genera_grasses_by_presence = NA, .before = "neighbors_count")
-ecoregions <- tibble::add_column(ecoregions, rarity_genera_grasses_by_ecoregion = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_weighted_richness_species = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_weighted_richness_species_vascular = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_weighted_richness_genera = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_weighted_richness_genera_vascular = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_weighted_richness_species_trees = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_weighted_richness_genera_trees = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_weighted_richness_species_grasses = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, rarity_weighted_richness_genera_grasses = NA, .before = "neighbors_count")
+
+ecoregions <- tibble::add_column(ecoregions, mean_rarity_species = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, mean_rarity_species_vascular = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, mean_rarity_genera = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, mean_rarity_genera_vascular = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, mean_rarity_species_trees = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, mean_rarity_genera_trees = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, mean_rarity_species_grasses = NA, .before = "neighbors_count")
+ecoregions <- tibble::add_column(ecoregions, mean_rarity_genera_grasses = NA, .before = "neighbors_count")
 ```
 
 Then I iterate line by line to compute the rarity of each taxa pool. 
@@ -2466,70 +2533,60 @@ for(i in 1:nrow(ecoregions)){
   #getting ecoregion name
   ecoregion.i <- ecoregions[i, "ecoregion_name"]
 
-  #rarity species by presence
-  ecoregions[i, "rarity_species_by_presence"] <- sum(1 / dplyr::left_join(x = ecoregions_species[ecoregions_species$ecoregion == ecoregion.i,], y = species[, c("species", "spatial_records")], by = "species") %>% dplyr::pull(spatial_records))
-  
-    ecoregions[i, "rarity_species_vascular_by_presence"] <- sum(1 / dplyr::left_join(x = ecoregions_species_vascular[ecoregions_species_vascular$ecoregion == ecoregion.i,], y = species[, c("species", "spatial_records")], by = "species") %>% dplyr::pull(spatial_records))
-  
-  #
-  ecoregions[i, "rarity_species_trees_by_presence"] <- sum(1 / dplyr::left_join(x = ecoregions_species_trees[ecoregions_species_trees$ecoregion == ecoregion.i,], y = species[, c("species", "spatial_records")], by = "species") %>% dplyr::pull(spatial_records))
-  
-  #
-  ecoregions[i, "rarity_species_grasses_by_presence"] <- sum(1 / dplyr::left_join(x = ecoregions_species_grasses[ecoregions_species_grasses$ecoregion == ecoregion.i,], y = species[, c("species", "spatial_records")], by = "species") %>% dplyr::pull(spatial_records))
-  
-  #rarity genera by presence
-  #
-  ecoregions[i, "rarity_genera_by_presence"]  <-  sum( 1 / species %>% dplyr::filter(genus %in% ecoregions_genera[ecoregions_genera$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(spatial_records = sum(spatial_records)) %>% dplyr::pull(spatial_records))
-    
-  #
-  ecoregions[i, "rarity_genera_vascular_by_presence"]  <-  sum( 1 / species %>% dplyr::filter(genus %in% ecoregions_genera_vascular[ecoregions_genera_vascular$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(spatial_records = sum(spatial_records)) %>% dplyr::pull(spatial_records))
-    
-  #
-  ecoregions[i, "rarity_genera_trees_by_presence"] <-  sum(1 / species %>% dplyr::filter(genus %in% ecoregions_genera_trees[ecoregions_genera_trees$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(spatial_records = sum(spatial_records)) %>% dplyr::pull(spatial_records))
-    
-  #
-  ecoregions[i, "rarity_genera_grasses_by_presence"] <- sum(1 / species %>% dplyr::filter(genus %in% ecoregions_genera_grasses[ecoregions_genera_grasses$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(spatial_records = sum(spatial_records)) %>% dplyr::pull(spatial_records))
-    
-
   #rarity species by ecoregion
-  ecoregions[i, "rarity_species_by_ecoregion"] <- sum(1 /
+  ecoregions[i, "rarity_weighted_richness_species"] <- sum(1 /
     ecoregions_species %>% dplyr::filter(species %in% ecoregions_species[ecoregions_species$ecoregion == ecoregion.i, "species"]) %>% dplyr::group_by(species) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
   
+  ecoregions[i, "mean_rarity_species"] <- ecoregions[i, "rarity_weighted_richness_species"] / ecoregions[i, "richness_species"]
+  
   #
-  ecoregions[i, "rarity_species_vascular_by_ecoregion"] <- sum(1 /
+  ecoregions[i, "rarity_weighted_richness_species_vascular"] <- sum(1 /
     ecoregions_species_vascular %>% dplyr::filter(species %in% ecoregions_species_vascular[ecoregions_species_vascular$ecoregion == ecoregion.i, "species"]) %>% dplyr::group_by(species) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
   
+  ecoregions[i, "mean_rarity_species_vascular"] <- ecoregions[i, "rarity_weighted_richness_species_vascular"] / ecoregions[i, "richness_species_vascular"]
+  
   #
-  ecoregions[i, "rarity_species_trees_by_ecoregion"] <- sum(1 /
+  ecoregions[i, "rarity_weighted_richness_species_trees"] <- sum(1 /
     ecoregions_species_trees %>% dplyr::filter(species %in% ecoregions_species_trees[ecoregions_species_trees$ecoregion == ecoregion.i, "species"]) %>% dplyr::group_by(species) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
   
-  #
-  ecoregions[i, "rarity_species_grasses_by_ecoregion"] <- sum(1 /
-    ecoregions_species_grasses %>% dplyr::filter(species %in% ecoregions_species_grasses[ecoregions_species_grasses$ecoregion == ecoregion.i, "species"]) %>% dplyr::group_by(species) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
-
-  #rarity by genus and ecoregion
+  ecoregions[i, "mean_rarity_species_trees"] <- ecoregions[i, "rarity_weighted_richness_species_trees"] / ecoregions[i, "richness_species_trees"]
   
   #
-  ecoregions[i, "rarity_genera_by_ecoregion"] <- sum(1 /
+  ecoregions[i, "rarity_weighted_richness_species_grasses"] <- sum(1 /
+    ecoregions_species_grasses %>% dplyr::filter(species %in% ecoregions_species_grasses[ecoregions_species_grasses$ecoregion == ecoregion.i, "species"]) %>% dplyr::group_by(species) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+  
+    ecoregions[i, "mean_rarity_species_grasses"] <- ecoregions[i, "rarity_weighted_richness_species_grasses"] / ecoregions[i, "richness_species_grasses"]
+  
+  #
+  ecoregions[i, "rarity_weighted_richness_genera"] <- sum(1 /
     ecoregions_genera %>% dplyr::filter(genus %in% ecoregions_genera[ecoregions_genera$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
   
+   ecoregions[i, "mean_rarity_genera"] <- ecoregions[i, "rarity_weighted_richness_genera"] / ecoregions[i, "richness_genera"]
+  
   #
-  ecoregions[i, "rarity_genera_vascular_by_ecoregion"] <- sum(1 /
+  ecoregions[i, "rarity_weighted_richness_genera_vascular"] <- sum(1 /
     ecoregions_genera_vascular %>% dplyr::filter(genus %in% ecoregions_genera_vascular[ecoregions_genera_vascular$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
   
-  #
-  ecoregions[i, "rarity_genera_trees_by_ecoregion"] <- sum(1 /
-    ecoregions_genera_trees %>% dplyr::filter(genus %in% ecoregions_genera_trees[ecoregions_genera_trees$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+     ecoregions[i, "mean_rarity_genera_vascular"] <- ecoregions[i, "rarity_weighted_richness_genera_vascular"] / ecoregions[i, "richness_genera_vascular"]
+
   
   #
-  ecoregions[i, "rarity_genera_grasses_by_ecoregion"] <-  sum(1 /
+  ecoregions[i, "rarity_weighted_richness_genera_trees"] <- sum(1 /
+    ecoregions_genera_trees %>% dplyr::filter(genus %in% ecoregions_genera_trees[ecoregions_genera_trees$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+  
+  ecoregions[i, "mean_rarity_genera_trees"] <- ecoregions[i, "rarity_weighted_richness_genera_trees"] / ecoregions[i, "richness_genera_trees"]
+  
+  #
+  ecoregions[i, "rarity_weighted_richness_genera_grasses"] <-  sum(1 /
     ecoregions_genera_grasses %>% dplyr::filter(genus %in% ecoregions_genera_grasses[ecoregions_genera_grasses$ecoregion == ecoregion.i, "genus"]) %>% dplyr::group_by(genus) %>% dplyr::summarise(n_ecoregions = n()) %>% dplyr::pull(n_ecoregions))
+  
+  ecoregions[i, "mean_rarity_genera_grasses"] <- ecoregions[i, "rarity_weighted_richness_genera_grasses"] / ecoregions[i, "richness_genera_grasses"]
   
 
 }
 ```
 
-To compute the percentag of exclusive species, genera, and families...
+To compute the percentage of exclusive species and genera (families are omitted because they yield too many zeros)
 
 ```{r}
 ecoregions <- tibble::add_column(ecoregions, exclusive_species = NA, .before = "neighbors_count")
@@ -2595,7 +2652,6 @@ for(i in 1:nrow(ecoregions)){
   ecoregions[i, "exclusive_genera_grasses"] <- sum(table(ecoregions_genera_grasses$genus[ecoregions_genera_grasses$genus %in% ecoregions_genera_grasses[ecoregions_genera_grasses$ecoregion == ecoregion.i, "genus"]]) == 1)
   
   ecoregions[i, "exclusive_genera_grasses_percentage"] <- (ecoregions[i, "exclusive_genera_grasses"] * 100) / ecoregions[i, "richness_genera_grasses"]
-  
   
 }
 ```
@@ -2747,7 +2803,6 @@ There is a large number of betadiversity measures. Here I use four compute:
 We examined Koleff, Gaston & Lennon (2003) searching for indexes with different properties and selected two of them: (1) the Sorensen similarity index (bsor), presented by Lennon et al. (2001), is a measure of continuity that depends on the variation of the matching component a. To allow the comparison of bsor with the other indexes, we transformed its values into dissimilarity by subtracting the equation in Koleff, Gaston & Lennon (2003) by one (see Eq. 3). According to Eq. 3, bsor has its upper limit at one (strong dissimilarity between compositions) and the lower limit at zero (strong similarity between compositions); (2) the symmetric form of the Simpson’s dissimilarity index (bsim, Eq. 4), that was also presented in Lennon et al. (2001), derived from the one proposed by Simpson (1943), and reformulated by Koleff, Gaston & Lennon (2003). bsim is a measure of turnover focused on compositional differences instead of differences in species richness. The upper bsim value is found when the observed and predicted compositions have no species in common, and the lower value is zero, when both compositions are the same.
 
   + **Richness similarity**, computed as $R = |(a + b) - (a + c)|$ for the raw version, and $R. = |(a. + b.) - (a. + c.)|$ for the percentage version.
-  + **Composition similarity**, computed as $C = (b + c) / a$ for the raw species numbers. Not computed for species percentages because it yields the same result.
   + **Sorensen similarity index** (Lennon et al. 2001), computed as $Bsor = 1 - (2a / (2a + b + c))$ for the raw numbers, and not computed for the species percentages.
   + **Simpson's dissimilarity index** (Lennon et al. 2001), computed as $Bsim = min(b, c) / (min(b, c) + a)$ for the raw numbers only (yields same result with percentages of the total species pool.)
   
@@ -2755,9 +2810,6 @@ We examined Koleff, Gaston & Lennon (2003) searching for indexes with different 
 #richness similarity
 R <- abs((a + b) - (a + c))
 R. <- abs((a. + b.) - (a. + c.))
-
-#composition similarity
-C <- (b + c) / a
 
 #Sorensen similarity index
 Bsor <- 1 - (2 * a / (2 * a + b + c))
@@ -2804,7 +2856,6 @@ betadiversity.components <- c(
   "c_percent", 
   "R", 
   "R_percent", 
-  "C", 
   "Bsor", 
   "Bsim")
 
@@ -3185,8 +3236,381 @@ for(i in 1:nrow(ecoregions_pairs)){
 }
 ```
 
+
+
+Identifying NA and Inf in `ecoregions` and `ecoregions_pairs`
+
 ```{r}
-save(ecoregions, ecoregions_pairs, file = "ecoregions_data.RData")
+ecoregions.inf <- apply(ecoregions, 2, function(x) any(is.na(x) | is.infinite(x)))
+ecoregions.inf[ecoregions.inf == TRUE]
+```
+
+```{r}
+ecoregions_pairs.inf <- apply(ecoregions_pairs, 2, function(x) any(is.na(x) | is.infinite(x)))
+ecoregions_pairs.inf[ecoregions.inf == TRUE]
+```
+
+There are no NA or Inf in either dataset.
+
+Fixing several column names for consistency.
+
+```{r}
+ecoregions <- dplyr::rename(
+  ecoregions,
+  exclusive_percent_species = exclusive_species_percentage,
+  exclusive_percent_genera = exclusive_genera_percentage,
+  exclusive_percent_species_vascular = exclusive_species_vascular_percentage,
+  exclusive_percent_genera_vascular = exclusive_genera_vascular_percentage,
+  exclusive_percent_species_trees = exclusive_species_trees_percentage,
+  exclusive_percent_genera_trees = exclusive_genera_trees_percentage,
+  exclusive_percent_species_grasses = exclusive_species_grasses_percentage,
+  exclusive_percent_genera_grasses = exclusive_genera_grasses_percentage,
+  neighbors_percent_shared_edge = neighbors_percentage_shared_edge,
+  neighbors_count_average_species = neighbors_species_count_average,
+  neighbors_count_average_genera = neighbors_genera_count_average,
+  neighbor_count_averages_families = neighbors_families_count_average,
+  neighbors_count_average_classes = neighbors_classes_count_average,
+  betadiversity_a_species = betadiversity_species_a,
+  betadiversity_b_species = betadiversity_species_b,
+  betadiversity_c_species = betadiversity_species_c,
+  betadiversity_a_percent_species = betadiversity_species_a_percent,
+  betadiversity_b_percent_species = betadiversity_species_b_percent,
+  betadiversity_c_percent_species = betadiversity_species_c_percent,
+  betadiversity_R_species = betadiversity_species_R,
+  betadiversity_R_percent_species = betadiversity_species_R_percent,
+  betadiversity_Bsor_species = betadiversity_species_Bsor,
+  betadiversity_Bsim_species = betadiversity_species_Bsim,
+  betadiversity_a_genera = betadiversity_genera_a,
+  betadiversity_b_genera = betadiversity_genera_b,
+  betadiversity_c_genera = betadiversity_genera_c,
+  betadiversity_a_percent_genera = betadiversity_genera_a_percent,
+  betadiversity_b_percent_genera = betadiversity_genera_b_percent,
+  betadiversity_c_percent_genera = betadiversity_genera_c_percent,
+  betadiversity_R_genera = betadiversity_genera_R,
+  betadiversity_R_percent_genera = betadiversity_genera_R_percent,
+  betadiversity_Bsor_genera = betadiversity_genera_Bsor,
+  betadiversity_Bsim_genera = betadiversity_genera_Bsim,
+  betadiversity_a_families = betadiversity_families_a,
+  betadiversity_b_families = betadiversity_families_b,
+  betadiversity_c_families = betadiversity_families_c,
+  betadiversity_a_percent_families = betadiversity_families_a_percent,
+  betadiversity_b_percent_families = betadiversity_families_b_percent,
+  betadiversity_c_percent_families = betadiversity_families_c_percent,
+  betadiversity_R_families = betadiversity_families_R,
+  betadiversity_R_percent_families = betadiversity_families_R_percent,
+  betadiversity_Bsor_families = betadiversity_families_Bsor,
+  betadiversity_Bsim_families = betadiversity_families_Bsim,
+  betadiversity_a_species_vascular = betadiversity_species_vascular_a,
+  betadiversity_b_species_vascular = betadiversity_species_vascular_b,
+  betadiversity_c_species_vascular = betadiversity_species_vascular_c,
+  betadiversity_a_percent_species_vascular = betadiversity_species_vascular_a_percent,
+  betadiversity_b_percent_species_vascular = betadiversity_species_vascular_b_percent,
+  betadiversity_c_percent_species_vascular = betadiversity_species_vascular_c_percent,
+  betadiversity_R_species_vascular = betadiversity_species_vascular_R,
+  betadiversity_R_percent_species_vascular = betadiversity_species_vascular_R_percent,
+  betadiversity_Bsor_species_vascular = betadiversity_species_vascular_Bsor,
+  betadiversity_Bsim_species_vascular = betadiversity_species_vascular_Bsim,
+  betadiversity_a_genera_vascular = betadiversity_genera_vascular_a,
+  betadiversity_b_genera_vascular = betadiversity_genera_vascular_b,
+  betadiversity_c_genera_vascular = betadiversity_genera_vascular_c,
+  betadiversity_a_percent_genera_vascular = betadiversity_genera_vascular_a_percent,
+  betadiversity_b_percent_genera_vascular = betadiversity_genera_vascular_b_percent,
+  betadiversity_c_percent_genera_vascular = betadiversity_genera_vascular_c_percent,
+  betadiversity_R_genera_vascular = betadiversity_genera_vascular_R,
+  betadiversity_R_percent_genera_vascular = betadiversity_genera_vascular_R_percent,
+  betadiversity_Bsor_genera_vascular = betadiversity_genera_vascular_Bsor,
+  betadiversity_Bsim_genera_vascular = betadiversity_genera_vascular_Bsim,
+  betadiversity_a_families_vascular = betadiversity_families_vascular_a,
+  betadiversity_b_families_vascular = betadiversity_families_vascular_b,
+  betadiversity_c_families_vascular = betadiversity_families_vascular_c,
+  betadiversity_a_percent_families_vascular = betadiversity_families_vascular_a_percent,
+  betadiversity_b_percent_families_vascular = betadiversity_families_vascular_b_percent,
+  betadiversity_c_percent_families_vascular = betadiversity_families_vascular_c_percent,
+  betadiversity_R_families_vascular = betadiversity_families_vascular_R,
+  betadiversity_R_percent_families_vascular = betadiversity_families_vascular_R_percent,
+  betadiversity_Bsor_families_vascular = betadiversity_families_vascular_Bsor,
+  betadiversity_Bsim_families_vascular = betadiversity_families_vascular_Bsim,
+  betadiversity_a_species_trees = betadiversity_species_trees_a,
+  betadiversity_b_species_trees = betadiversity_species_trees_b,
+  betadiversity_c_species_trees = betadiversity_species_trees_c,
+  betadiversity_a_percent_species_trees = betadiversity_species_trees_a_percent,
+  betadiversity_b_percent_species_trees = betadiversity_species_trees_b_percent,
+  betadiversity_c_percent_species_trees = betadiversity_species_trees_c_percent,
+  betadiversity_R_species_trees = betadiversity_species_trees_R,
+  betadiversity_R_percent_species_trees = betadiversity_species_trees_R_percent,
+  betadiversity_Bsor_species_trees = betadiversity_species_trees_Bsor,
+  betadiversity_Bsim_species_trees = betadiversity_species_trees_Bsim,
+  betadiversity_a_genera_trees = betadiversity_genera_trees_a,
+  betadiversity_b_genera_trees = betadiversity_genera_trees_b,
+  betadiversity_c_genera_trees = betadiversity_genera_trees_c,
+  betadiversity_a_percent_genera_trees = betadiversity_genera_trees_a_percent,
+  betadiversity_b_percent_genera_trees = betadiversity_genera_trees_b_percent,
+  betadiversity_c_percent_genera_trees = betadiversity_genera_trees_c_percent,
+  betadiversity_R_genera_trees = betadiversity_genera_trees_R,
+  betadiversity_R_percent_genera_trees = betadiversity_genera_trees_R_percent,
+  betadiversity_Bsor_genera_trees = betadiversity_genera_trees_Bsor,
+  betadiversity_Bsim_genera_trees = betadiversity_genera_trees_Bsim,
+  betadiversity_a_families_trees = betadiversity_families_trees_a,
+  betadiversity_b_families_trees = betadiversity_families_trees_b,
+  betadiversity_c_families_trees = betadiversity_families_trees_c,
+  betadiversity_a_percent_families_trees = betadiversity_families_trees_a_percent,
+  betadiversity_b_percent_families_trees = betadiversity_families_trees_b_percent,
+  betadiversity_c_percent_families_trees = betadiversity_families_trees_c_percent,
+  betadiversity_R_families_trees = betadiversity_families_trees_R,
+  betadiversity_R_percent_families_trees = betadiversity_families_trees_R_percent,
+  betadiversity_Bsor_families_trees = betadiversity_families_trees_Bsor,
+  betadiversity_Bsim_families_trees = betadiversity_families_trees_Bsim,
+    betadiversity_a_species_grasses = betadiversity_species_grasses_a,
+  betadiversity_b_species_grasses = betadiversity_species_grasses_b,
+  betadiversity_c_species_grasses = betadiversity_species_grasses_c,
+  betadiversity_a_percent_species_grasses = betadiversity_species_grasses_a_percent,
+  betadiversity_b_percent_species_grasses = betadiversity_species_grasses_b_percent,
+  betadiversity_c_percent_species_grasses = betadiversity_species_grasses_c_percent,
+  betadiversity_R_species_grasses = betadiversity_species_grasses_R,
+  betadiversity_R_percent_species_grasses = betadiversity_species_grasses_R_percent,
+  betadiversity_Bsor_species_grasses = betadiversity_species_grasses_Bsor,
+  betadiversity_Bsim_species_grasses = betadiversity_species_grasses_Bsim,
+  betadiversity_a_genera_grasses = betadiversity_genera_grasses_a,
+  betadiversity_b_genera_grasses = betadiversity_genera_grasses_b,
+  betadiversity_c_genera_grasses = betadiversity_genera_grasses_c,
+  betadiversity_a_percent_genera_grasses = betadiversity_genera_grasses_a_percent,
+  betadiversity_b_percent_genera_grasses = betadiversity_genera_grasses_b_percent,
+  betadiversity_c_percent_genera_grasses = betadiversity_genera_grasses_c_percent,
+  betadiversity_R_genera_grasses = betadiversity_genera_grasses_R,
+  betadiversity_R_percent_genera_grasses = betadiversity_genera_grasses_R_percent,
+  betadiversity_Bsor_genera_grasses = betadiversity_genera_grasses_Bsor,
+  betadiversity_Bsim_genera_grasses = betadiversity_genera_grasses_Bsim
+)
+```
+
+```{r}
+ecoregions_pairs <- dplyr::rename(
+  ecoregions_pairs,
+  betadiversity_a_species = betadiversity_species_a,
+  betadiversity_b_species = betadiversity_species_b,
+  betadiversity_c_species = betadiversity_species_c,
+  betadiversity_a_percent_species = betadiversity_species_a_percent,
+  betadiversity_b_percent_species = betadiversity_species_b_percent,
+  betadiversity_c_percent_species = betadiversity_species_c_percent,
+  betadiversity_R_species = betadiversity_species_R,
+  betadiversity_R_percent_species = betadiversity_species_R_percent,
+  betadiversity_Bsor_species = betadiversity_species_Bsor,
+  betadiversity_Bsim_species = betadiversity_species_Bsim,
+  betadiversity_a_genera = betadiversity_genera_a,
+  betadiversity_b_genera = betadiversity_genera_b,
+  betadiversity_c_genera = betadiversity_genera_c,
+  betadiversity_a_percent_genera = betadiversity_genera_a_percent,
+  betadiversity_b_percent_genera = betadiversity_genera_b_percent,
+  betadiversity_c_percent_genera = betadiversity_genera_c_percent,
+  betadiversity_R_genera = betadiversity_genera_R,
+  betadiversity_R_percent_genera = betadiversity_genera_R_percent,
+  betadiversity_Bsor_genera = betadiversity_genera_Bsor,
+  betadiversity_Bsim_genera = betadiversity_genera_Bsim,
+  betadiversity_a_families = betadiversity_families_a,
+  betadiversity_b_families = betadiversity_families_b,
+  betadiversity_c_families = betadiversity_families_c,
+  betadiversity_a_percent_families = betadiversity_families_a_percent,
+  betadiversity_b_percent_families = betadiversity_families_b_percent,
+  betadiversity_c_percent_families = betadiversity_families_c_percent,
+  betadiversity_R_families = betadiversity_families_R,
+  betadiversity_R_percent_families = betadiversity_families_R_percent,
+  betadiversity_Bsor_families = betadiversity_families_Bsor,
+  betadiversity_Bsim_families = betadiversity_families_Bsim,
+  betadiversity_a_species_vascular = betadiversity_species_vascular_a,
+  betadiversity_b_species_vascular = betadiversity_species_vascular_b,
+  betadiversity_c_species_vascular = betadiversity_species_vascular_c,
+  betadiversity_a_percent_species_vascular = betadiversity_species_vascular_a_percent,
+  betadiversity_b_percent_species_vascular = betadiversity_species_vascular_b_percent,
+  betadiversity_c_percent_species_vascular = betadiversity_species_vascular_c_percent,
+  betadiversity_R_species_vascular = betadiversity_species_vascular_R,
+  betadiversity_R_percent_species_vascular = betadiversity_species_vascular_R_percent,
+  betadiversity_Bsor_species_vascular = betadiversity_species_vascular_Bsor,
+  betadiversity_Bsim_species_vascular = betadiversity_species_vascular_Bsim,
+  betadiversity_a_genera_vascular = betadiversity_genera_vascular_a,
+  betadiversity_b_genera_vascular = betadiversity_genera_vascular_b,
+  betadiversity_c_genera_vascular = betadiversity_genera_vascular_c,
+  betadiversity_a_percent_genera_vascular = betadiversity_genera_vascular_a_percent,
+  betadiversity_b_percent_genera_vascular = betadiversity_genera_vascular_b_percent,
+  betadiversity_c_percent_genera_vascular = betadiversity_genera_vascular_c_percent,
+  betadiversity_R_genera_vascular = betadiversity_genera_vascular_R,
+  betadiversity_R_percent_genera_vascular = betadiversity_genera_vascular_R_percent,
+  betadiversity_Bsor_genera_vascular = betadiversity_genera_vascular_Bsor,
+  betadiversity_Bsim_genera_vascular = betadiversity_genera_vascular_Bsim,
+  betadiversity_a_families_vascular = betadiversity_families_vascular_a,
+  betadiversity_b_families_vascular = betadiversity_families_vascular_b,
+  betadiversity_c_families_vascular = betadiversity_families_vascular_c,
+  betadiversity_a_percent_families_vascular = betadiversity_families_vascular_a_percent,
+  betadiversity_b_percent_families_vascular = betadiversity_families_vascular_b_percent,
+  betadiversity_c_percent_families_vascular = betadiversity_families_vascular_c_percent,
+  betadiversity_R_families_vascular = betadiversity_families_vascular_R,
+  betadiversity_R_percent_families_vascular = betadiversity_families_vascular_R_percent,
+  betadiversity_Bsor_families_vascular = betadiversity_families_vascular_Bsor,
+  betadiversity_Bsim_families_vascular = betadiversity_families_vascular_Bsim,
+  betadiversity_a_species_trees = betadiversity_species_trees_a,
+  betadiversity_b_species_trees = betadiversity_species_trees_b,
+  betadiversity_c_species_trees = betadiversity_species_trees_c,
+  betadiversity_a_percent_species_trees = betadiversity_species_trees_a_percent,
+  betadiversity_b_percent_species_trees = betadiversity_species_trees_b_percent,
+  betadiversity_c_percent_species_trees = betadiversity_species_trees_c_percent,
+  betadiversity_R_species_trees = betadiversity_species_trees_R,
+  betadiversity_R_percent_species_trees = betadiversity_species_trees_R_percent,
+  betadiversity_Bsor_species_trees = betadiversity_species_trees_Bsor,
+  betadiversity_Bsim_species_trees = betadiversity_species_trees_Bsim,
+  betadiversity_a_genera_trees = betadiversity_genera_trees_a,
+  betadiversity_b_genera_trees = betadiversity_genera_trees_b,
+  betadiversity_c_genera_trees = betadiversity_genera_trees_c,
+  betadiversity_a_percent_genera_trees = betadiversity_genera_trees_a_percent,
+  betadiversity_b_percent_genera_trees = betadiversity_genera_trees_b_percent,
+  betadiversity_c_percent_genera_trees = betadiversity_genera_trees_c_percent,
+  betadiversity_R_genera_trees = betadiversity_genera_trees_R,
+  betadiversity_R_percent_genera_trees = betadiversity_genera_trees_R_percent,
+  betadiversity_Bsor_genera_trees = betadiversity_genera_trees_Bsor,
+  betadiversity_Bsim_genera_trees = betadiversity_genera_trees_Bsim,
+  betadiversity_a_families_trees = betadiversity_families_trees_a,
+  betadiversity_b_families_trees = betadiversity_families_trees_b,
+  betadiversity_c_families_trees = betadiversity_families_trees_c,
+  betadiversity_a_percent_families_trees = betadiversity_families_trees_a_percent,
+  betadiversity_b_percent_families_trees = betadiversity_families_trees_b_percent,
+  betadiversity_c_percent_families_trees = betadiversity_families_trees_c_percent,
+  betadiversity_R_families_trees = betadiversity_families_trees_R,
+  betadiversity_R_percent_families_trees = betadiversity_families_trees_R_percent,
+  betadiversity_Bsor_families_trees = betadiversity_families_trees_Bsor,
+  betadiversity_Bsim_families_trees = betadiversity_families_trees_Bsim,
+  betadiversity_a_species_grasses = betadiversity_species_grasses_a,
+  betadiversity_b_species_grasses = betadiversity_species_grasses_b,
+  betadiversity_c_species_grasses = betadiversity_species_grasses_c,
+  betadiversity_a_percent_species_grasses = betadiversity_species_grasses_a_percent,
+  betadiversity_b_percent_species_grasses = betadiversity_species_grasses_b_percent,
+  betadiversity_c_percent_species_grasses = betadiversity_species_grasses_c_percent,
+  betadiversity_R_species_grasses = betadiversity_species_grasses_R,
+  betadiversity_R_percent_species_grasses = betadiversity_species_grasses_R_percent,
+  betadiversity_Bsor_species_grasses = betadiversity_species_grasses_Bsor,
+  betadiversity_Bsim_species_grasses = betadiversity_species_grasses_Bsim,
+  betadiversity_a_genera_grasses = betadiversity_genera_grasses_a,
+  betadiversity_b_genera_grasses = betadiversity_genera_grasses_b,
+  betadiversity_c_genera_grasses = betadiversity_genera_grasses_c,
+  betadiversity_a_percent_genera_grasses = betadiversity_genera_grasses_a_percent,
+  betadiversity_b_percent_genera_grasses = betadiversity_genera_grasses_b_percent,
+  betadiversity_c_percent_genera_grasses = betadiversity_genera_grasses_c_percent,
+  betadiversity_R_genera_grasses = betadiversity_genera_grasses_R,
+  betadiversity_R_percent_genera_grasses = betadiversity_genera_grasses_R_percent,
+  betadiversity_Bsor_genera_grasses = betadiversity_genera_grasses_Bsor,
+  betadiversity_Bsim_genera_grasses = betadiversity_genera_grasses_Bsim,
+  diff_richness_species = richness_species_diff,
+  diff_richness_genera = richness_genera_diff,
+  diff_richness_families = richness_families_diff,
+  diff_richness_classes = richness_classes_diff,
+  diff_richness_species_vascular = richness_species_vascular_diff,
+  diff_richness_genera_vascular = richness_genera_vascular_diff,
+  diff_richness_families_vascular = richness_families_vascular_diff,
+  diff_richness_classes_vascular = richness_classes_vascular_diff,
+  diff_climate_aridity_index = climate_aridity_index_diff,
+  diff_climate_bio1_average = climate_bio1_average_diff,
+  diff_climate_bio4_average = climate_bio4_average_diff,
+  diff_climate_bio5_average = climate_bio5_average_diff,
+  diff_climate_bio12_average = climate_bio12_average_diff,
+  diff_climate_bio15_average = climate_bio15_average_diff,
+  diff_climate_velocity_lgm_average = climate_velocity_lgm_average_diff,
+  diff_human_footprint_average = human_footprint_average_diff,
+  diff_human_population = human_population_diff,
+  diff_human_population_density = human_population_density_diff,
+  diff_landcover_bare_percent_average = landcover_bare_percent_average_diff,
+  diff_landcover_herbs_percent_average  = landcover_herbs_percent_average_diff,
+  diff_landcover_trees_percent_average = landcover_trees_percent_average_diff,
+  diff_landcover_ndvi_min = landcover_ndvi_min_diff,
+  diff_landcover_ndvi_max = landcover_ndvi_max_diff,
+  diff_topography_elevation = topography_elevation_diff
+)
+```
+
+### Removing columns corresponding to the group "all species", to only work with the groups "vascular plants", and its subsets "trees" and "grasses".
+
+```{r}
+#finding indices of columns to remove
+i1 <- which(endsWith(x = names(ecoregions), suffix = "_species"))
+i2 <- which(endsWith(x = names(ecoregions), suffix = "_genera"))
+i3 <- which(endsWith(x = names(ecoregions), suffix = "_families"))
+i4 <- which(endsWith(x = names(ecoregions), suffix = "_classes"))
+i5 <- which(endsWith(x = names(ecoregions), suffix = "_phyla"))
+cols.to.remove <- c(i1, i2, i3, i4, i5)
+
+#subsetting ecoregions
+ecoregions[, cols.to.remove]  <- list(NULL)
+```
+
+Same for ecoregions_pairs
+
+```{r}
+#finding indices of columns to remove
+i1 <- which(endsWith(x = names(ecoregions_pairs), suffix = "_species"))
+i2 <- which(endsWith(x = names(ecoregions_pairs), suffix = "_genera"))
+i3 <- which(endsWith(x = names(ecoregions_pairs), suffix = "_families"))
+i4 <- which(endsWith(x = names(ecoregions_pairs), suffix = "_classes"))
+i5 <- which(endsWith(x = names(ecoregions_pairs), suffix = "_phyla"))
+cols.to.remove <- c(i1, i2, i3, i4, i5)
+
+#subsetting ecoregions
+ecoregions_pairs[, cols.to.remove]  <- list(NULL)
+```
+
+### Generating the polygon and centroids files.
+
+Building ecoregion centroids and reading spatial features of the selected ecoregions into R to be able to plot maps and distance matrices.
+
+```{sql connection=postgresql.connection}
+ALTER TABLE ecoregions
+ADD COLUMN geom_centroid geometry;
+```
+
+```{sql connection=postgresql.connection}
+UPDATE TABLE ecoregions
+SET geom_centroid = ST_PointOnSurface(ST_MakeValid(geom_simple::geography));
+```
+
+Reading to sf.
+
+```{r}
+ecoregions_polygons = sf::st_read(
+  dsn = postgresql.connection,
+  query = "SELECT ecoregion, geom FROM ecoregions",
+  geometry_column = "geom"
+  )
+colnames(ecoregions_polygons) <- c("ecoregion_name", "geom")
+
+ecoregions_centroids = sf::st_read(
+  dsn = postgresql.connection,
+  query = "SELECT ecoregion, geom_centroid FROM ecoregions",
+  geometry_column = "geom_centroid"
+  )
+colnames(ecoregions_centroids) <- c("ecoregion_name", "geom_centroids")
+```
+
+Adding columns of `ecoregions` to `ecoregions_polygons`
+
+```{r}
+ecoregions_polygons <- dplyr::filter(
+  ecoregions_polygons,
+  ecoregion_name %in% ecoregions$ecoregion_name
+) %>% 
+  dplyr::left_join(
+    y = ecoregions,
+    by = "ecoregion_name"
+  )
+
+ecoregions_centroids <- dplyr::filter(
+  ecoregions_centroids,
+  ecoregion_name %in% ecoregions$ecoregion_name
+)
+```
+
+```{r}
+save(
+  ecoregions, 
+  ecoregions_polygons, 
+  ecoregions_centroids, 
+  ecoregions_pairs, 
+  file = "ecoregions_plant_diversity.RData"
+  )
 ```
 
 

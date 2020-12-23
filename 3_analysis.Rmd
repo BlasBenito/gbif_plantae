@@ -1,0 +1,513 @@
+---
+title: "Analysis"
+output: html_notebook
+---
+
+```{r, echo = FALSE}
+#automatic install of packages if they are not readily available
+list.of.packages <- c(
+  "tidyverse", 
+  "ggplot2",
+  "patchwork",
+  "sf",
+  "viridis",
+  "kableExtra",
+  "sp",
+  "spdep",
+  "adespatial",
+  "parallel",
+  "doParallel",
+  "foreach",
+  "lavaan",
+  "ranger",
+  "quantable",
+  "factoextra"
+  )
+
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+
+#installing missing packages
+if(length(new.packages) > 0){
+  install.packages(new.packages, dep=TRUE)
+}
+
+#loading packages
+for(package.i in list.of.packages){
+  suppressPackageStartupMessages(library(package.i, character.only = TRUE))
+}
+
+#loading functions
+source("functions.R")
+
+#removing scientific notation
+options(scipen = 9999)
+
+#setting ggplot2 theme
+ggplot2::theme_set(theme_bw())
+
+#loading data
+load("ecoregions_plant_diversity_ready.RData")
+
+rm(list.of.packages, new.packages, package.i)
+```
+
+
+## Drivers of richness, rarity, and betadiversity in the world's ecoregions
+
+Here I use the `ecoregions` dataset to assess how climate, humans, fragmentation, topography, and landcover shape diversity measures such as richness, mean rarity, percentage of exclusive species, and betadiversity with neighboring ecoregions. Considering the different ranges and distributions of the range variables, to obtain comparable outcomes and simplify the modeling process I will be fitting regression models with Random Forest using the `ranger` library (citation).
+
+The critical parameters for the ranger models to be fitted are defined here:
+
+```{r}
+ranger.arguments <- list()
+ranger.arguments$mtry <- 3 #random variables to select on each split
+ranger.arguments$min.node.size <- 2 #minimum number of ecoregions in a terminal node
+ranger.arguments$importance <- "permutation" 
+ranger.arguments$scale.permutation.importance <- FALSE
+ranger.arguments$local.importance <- TRUE
+ranger.arguments$keep.inbag <- TRUE
+ranger.arguments$oob.error <- TRUE
+ranger.arguments$num.threads <- 7
+ranger.arguments$trees.per.variable <- 50
+iterations <- 10
+distance.matrix <- ecoregions_pairs$distance
+```
+
+To fit these models here I use the custom function `rf()`, that encapsulates `ranger()` to provide extended results including a Moran's I analysis of the autocorrelation of the residuals, a pseudo R-squared value for the model (correlation between observed and predicted values), and the importance of the predictors that includes a white noise and an autocorrelated noise variable as references for effect significance. Since randomness affects the results of random forest, `rf()` is executed several times by the function `repeat_rf()`, that aggregates key metrics of model accuracy and variable importance to facilitate the interpretation of the results.
+
+There are 65 response variables divided in tree groups of diversity measures (richness, rarity, and betadiversity) with nine different measures for three taxonomic levels (species, genera, families) of three target groups (vascular plants and two of its subgroups, trees and grasses). The only exception for these combinations are grasses, that belong to the *Poaceae* family, and therefore do not have "families" metrics. To facilitate the organization of results here I generate a template dataframe with the response variable name, the group, the taxonomic level, and the target group.
+
+```{r}
+#defining the different groups
+groups <- c(
+  "richness",
+  "rarity",
+  "betadiversity"
+)
+
+measures <- list(
+  richness = "richness",
+  rarity = c(
+    "rarity_weighted_richness",
+    "exclusive",
+    "exclusive_percent",
+    "mean_rarity"
+  ),
+  betadiversity = c(
+    "betadiversity_a_percent",
+    "betadiversity_Bsor",
+    "betadiversity_Bsim",
+    "betadiversity_R"
+  )
+)
+
+taxonomic.groups <- c(
+  "species",
+  "genera",
+  "families"
+)
+
+functional.groups <- c(
+  "vascular",
+  "trees",
+  "grasses"
+)
+
+#empty dataframe
+output.template <- data.frame(
+  response_variable = rep(NA, length(ecoregions$response.variables$all)),
+  group = rep(NA, length(ecoregions$response.variables$all)),
+  measure = rep(NA, length(ecoregions$response.variables$all)),
+  taxonomy = rep(NA, length(ecoregions$response.variables$all)),
+  functional = rep(NA, length(ecoregions$response.variables$all))
+)
+
+#filling dataframe
+row.i <- 1
+
+for(group.i in groups){
+  for(measure.i in measures[[group.i]]){
+    for(taxonomy.i in taxonomic.groups){
+      for(functional.i in functional.groups){
+        
+        #generating response variable name
+        response.variable.name <- paste(
+          measure.i, 
+          taxonomy.i, 
+          functional.i,
+          sep = "_"
+        )
+        
+        #if the response variable name is not a column of ecoregions$data, next
+        if(!(response.variable.name %in% ecoregions$names)){
+          next
+        }
+        
+        #filling the dataframe
+        output.template[row.i, "group"] <- group.i
+        output.template[row.i, "measure"] <- measure.i
+        output.template[row.i, "taxonomy"] <- taxonomy.i
+        output.template[row.i, "functional"] <- functional.i
+        output.template[row.i, "response_variable"] <- response.variable.name
+        
+        #one more line
+        row.i <- row.i + 1
+        
+      }
+    }
+  }
+}
+
+#removing empty rows
+output.template <- na.omit(output.template)
+
+#adding to ecoregions$response.variables$all
+ecoregions$response.variables$all <- output.template$response_variable
+
+rm(group.i, measure.i, taxonomy.i, functional.i, response.variable.name, row.i, groups, measures, taxonomic.groups, functional.groups)
+```
+
+
+### Accounting for bias and spatial structure
+
+#### Bias
+
+The `ecoregions` dataset has several variables that may indicate sampling bias:
+
+  + `bias_area_km2`: area of the ecoregion.
+  + `bias_species_per_record`: number of unique species divided by `bias_records`.
+  
+To control for potential biases in the completeness of the species lists for each ecoregion, these variables are included in every model as covariates.
+
+
+#### Spatial structure
+
+To represent the effect of the spatial structure of the data, the object `ecoregions$autocorrelation$pca.factors.selected` contains PCA factors of distance matrices thresholded at 100, 1000, and 10000 km to represent autocorrelation at different spatial scales.
+
+If a random forest model fitted with a diversity response variable and a set of covariates shows autocorrelated residuals for any of these three spatial scales, a new model per spatial scale is fit using the residuals as response variable, and the PCA factors of the given scales as predictors. The PCA factors are ranked according to their importance scores, and then added sequentially in such order until the residuals of the original model are not correlated for any spatial scale.
+
+
+```{r}
+#example model to develop the functions required for the analysis
+
+#response variable
+response <- "richness_species_vascular"
+predictors <- ecoregions$predictive.variables$all
+
+#generating training data
+training.data <- data.frame(
+  ecoregion_name = ecoregions$data$ecoregion_name,
+  ecoregions$data[, c(response, predictors)]
+)
+
+#fitting model
+rf.out <- rf(
+  data = training.data,
+  dependent.variable.name = response,
+  predictor.variable.names = predictors,
+  distance.matrix = distance.matrix,
+  white.noise = TRUE,
+  autocorrelated.noise = TRUE,
+  ranger.arguments = ranger.arguments
+)
+
+#fitting repeated model
+repeat_rf.out <- repeat_rf(
+  data = training.data,
+  dependent.variable.name = response,
+  predictor.variable.names = predictors,
+  distance.matrix = distance.matrix,
+  white.noise = TRUE,
+  autocorrelated.noise = TRUE,
+  iterations = 10,
+  ranger.arguments = ranger.arguments
+)
+```
+
+```{r}
+pca.factors <- pca_factors(
+  distance.matrix = distance.matrix
+)
+```
+
+
+
+```{r}
+m <- rf_spatial(
+  data = training.data,
+  dependent.variable.name = response,
+  predictor.variable.names = predictors,
+  white.noise = TRUE,
+  autocorrelated.noise = TRUE,
+  distance.matrix = distance.matrix,
+  iterations = 10,
+  ranger.arguments = ranger.arguments
+)
+
+```
+
+
+
+```{r}
+#object to store results
+distance.sensitivity <- list()
+
+#template dataframe to store results
+nas <- rep(NA, 100)
+template.df <- data.frame(
+  row = 1:100,
+  distance_pca_factor = nas,
+  r_squared = nas,
+  moran_i = nas,
+  moran_i_interpretation = nas
+)
+
+#adding one slot per response variable
+for(response.i in ecoregions$response.variables$all){
+  distance.sensitivity[[response.i]] <- template.df
+}
+
+#filling the output object
+
+#iterating through response variables
+for(response.i in ecoregions$response.variables$all){
+  
+  #iterating through distance pca factors
+  for(factor.i in 1:100){
+    
+    #message
+    message(
+      paste(
+        "Variable: ", 
+        response.i, 
+        "; added pca factor: ", 
+        names(ecoregions$autocorrelation$distance.pca)[factor.i], 
+        sep = ""
+        )
+      )
+    
+    #select the factors to use
+    factors.i <- names(ecoregions$autocorrelation$distance.pca)[1:factor.i]
+    
+    #variables
+    predictors <- c(
+      ecoregions$predictive.variables$bias, 
+      factors.i
+    )
+    
+    #generating training data
+    training.data <- data.frame(
+      ecoregion_name = ecoregions$data$ecoregion_name,
+      ecoregions$data[, c(response.i, ecoregions$predictive.variables$bias)],
+      ecoregions$autocorrelation$distance.pca[, factors.i]
+    )
+    colnames(training.data) <- c("ecoregion_name", response.i, ecoregions$predictive.variables$bias, factors.i)
+    
+    #fitting model
+    model.i <- repeat_rf(
+      data = training.data,
+      dependent.variable.name = response.i,
+      predictor.variable.names = predictors,
+      neighborhood = ecoregions$autocorrelation$weights.listw,
+      trees.per.variable = ranger.params$trees.per.variable,
+      model.arguments = ranger.params,
+      iterations = ranger.params$iterations
+    )
+    
+    #added factor
+    distance.sensitivity[[response.i]][factor.i, "distance_pca_factor"] <- names(ecoregions$autocorrelation$distance.pca)[factor.i]
+    
+    #extracting Moran's I
+    distance.sensitivity[[response.i]][factor.i, "moran_i"] <- mean(unlist(model.i$residuals.moran$moran.i))
+    
+    #extracting Moran's I interpretation
+    distance.sensitivity[[response.i]][factor.i, "moran_i_interpretation"] <- statistical_mode(unlist(model.i$residuals.moran$interpretation))
+    
+    #extracting r-squared
+    distance.sensitivity[[response.i]][factor.i, "r_squared"] <- mean(model.i$r.squared)
+    
+    #stopping condition
+    if(statistical_mode(unlist(model.i$residuals.moran$interpretation)) == "No autocorrelation"){
+      
+      #remove empty lines
+      distance.sensitivity[[response.i]] <- na.omit(distance.sensitivity[[response.i]])
+      
+      #go to next response variable
+      break
+    }
+    
+  }#end of loop across pca factors
+  
+}#end of loop across response variables
+
+rm(model.i, response.i, factor.i, factors.i, predictors, training.data, template.df)
+
+```
+
+The object `distance.sensitivity` created above has the distance pca factors required for each response variable, and the r-squared of the "base model" that is `bias + distance`.
+
+To allow plotting the results of the mitigation of spatial autocorrelation in the base models, I first convert `distance.sensitivity` into a dataframe.
+
+```{r}
+#adding name of the response variable to each dataframe
+for(response.i in names(distance.sensitivity)){
+  distance.sensitivity[[response.i]]$response_variable <- response.i
+}
+
+#into dataframe
+distance.sensitivity.df <- do.call("rbind", distance.sensitivity)
+
+#to group by taxonomic or functional groups, join with template.df
+distance.sensitivity.df <- dplyr::left_join(
+  distance.sensitivity.df,
+  response.variables.template,
+  by = "response_variable"
+)
+
+#rename row to pca_factors
+distance.sensitivity.df <- dplyr::rename(
+  distance.sensitivity.df,
+  pca_factors = row
+)
+```
+
+Below I plot how the Moran's I of the residuals and the R-squared of the models for each response variable change when adding PCA factors of the distance matrix.
+
+```{r, fig.width=9, fig.height=7}
+p1 <- ggplot(data = distance.sensitivity.df) + 
+  aes(
+    x = pca_factors, 
+    y = moran_i, 
+    group = response_variable,
+    color = group
+  ) + 
+  geom_line() + 
+  scale_color_viridis_d(end = 0.9) + 
+  labs(color = "Diversity measure") + 
+  ylab("Moran's I of the residuals") + 
+  xlab("") + 
+  theme(legend.position = "none") + 
+  scale_x_continuous(breaks = seq(0, 100, by = 10))
+
+p2 <- ggplot(data = distance.sensitivity.df) + 
+  aes(
+    x = pca_factors, 
+    y = r_squared, 
+    group = response_variable,
+    color = group
+  ) + 
+  geom_line() + 
+  scale_color_viridis_d(end = 0.9) + 
+  labs(color = "Diversity measure") + 
+  ylab("R-squared of the model") + 
+  xlab("Number of PCA factors of the distance matrix added to the model") + 
+  theme(legend.position = "bottom") + 
+  scale_x_continuous(breaks = seq(0, 100, by = 10))
+
+p1 / p2
+
+rm(p1, p2)
+```
+According to the figure above, there is a sharp reduction in the autocorrelation of the residuals for most models when 10 PCA factors are added. From that point, there are diminishing returns if the process continues, but it still helped to completely remove the spatial autocorrelation of most models. However, three rarity models reached the arbitrary threshold of 100 PCA factors added without completely removing their spatial autocorrelation. R-squared values did not suffer due to the procedure. Models with high values maintained their R-squared scores, while models with lower values at the beginning of the process increased their overall R-squared scores.
+
+## Base models
+
+Here I will use "base models" fitted as `bias + distance PCA factors` for every response variable to obtain *reference R-squared values*. These reference values represent to what extent each response variable can be predicted with bias and distances (spatial autocorrelation) alone, without other predictors of any kind.
+
+From this point, I need an object with the names of the PCA factors of the distance matrix required for each model, and a dataframe with the model name, and the R-quared values of the base model.
+
+First, the dataframe:
+
+```{r}
+#models df will save all results
+models.df <- response.variables.template
+models.df$base_model <- NA
+
+#iterating through response variables to fill r-squared
+for(response.i in models.df$response_variable){
+  models.df[models.df$response_variable == response.i, "base_model"] <- rev(distance.sensitivity[[response.i]]$r_squared)[1]
+}
+```
+
+Second, the object storing the names of the PCA factors needed on each model. Here I also add the PCA factors to `ecoregions$data` to facilitate subsetting operations
+
+```{r}
+#adding first 100 PCA factors to ecoregions$data
+ecoregions$data <- cbind(
+  ecoregions$data,
+  ecoregions$autocorrelation$distance.pca[, 1:100]
+)
+
+#adding vector with names of the distance PCA variables for each response variable to ecoregions$response.variables$distance.pca
+for(response.i in models.df$response_variable){
+  ecoregions$response.variables$distance.pca[[response.i]] <- distance.sensitivity[[response.i]]$distance_pca_factor
+}
+```
+
+
+## Fitting models by group of predictive variables
+
+In `ecoregions$predictive.variables` there are several groups of uncorrelated predictors:
+
+ + `neighbors`: relative to the number of neighbors and their area, and the percent of shared edge with them.
+ + `human`: relative to the effect of humans in the ecoregion.
+ + `climate`: defining the climate of the ecoregion.
+ + `landcover`: only one variable representing the average percentage of herbaceous cover.
+ + `topography`: only one variable representing the average elevation of the ecoregion.
+ + `fragmentation`: several indicators of the habitat fragmentation of the ecoregion.
+ 
+Here I fit one model per response variable and group of predictors of the form $$diversity variable = group of predictors + bias + distance PCA factors$$. From each model I catpure the R-squared, and compute the difference with the R-squared of the base model based on bias and distance variables only. This is an attempt to isolate the effect of each group of variables while still acccounting for sampling bias and spatial autocorrelation.
+
+```{r}
+predictors.groups <- c(
+  "neighbors",
+  "human",
+  "climate",
+  "landcover",
+  "topography",
+  "fragmentation"
+)
+
+#iterating through groups
+for(predictor.group.i in predictors.groups){
+  
+  #generate the column in models.df
+  models.df[[predictor.group.i]] <- NA
+  
+  #iterating through response variables
+  for(response.i in models.df$response_variable){
+    
+    #predictor names
+    predictors <- c(
+      ecoregions$predictive.variables[[predictor.group.i]],
+      ecoregions$predictive.variables$bias,
+      ecoregions$response.variables$distance.pca[[response.i]]
+    )
+    
+    #subsetting training data
+    training.data <- ecoregions$data[ , c(
+      "ecoregion_name",
+      response.i,
+      predictors
+    )]
+
+    #fitting model
+    model.i <- repeat_rf(
+      data = training.data,
+      dependent.variable.name = response.i,
+      predictor.variable.names = predictors,
+      neighborhood = ecoregions$autocorrelation$weights.listw,
+      trees.per.variable = ranger.params$trees.per.variable,
+      model.arguments = ranger.params,
+      iterations = ranger.params$iterations,
+      white.noise = FALSE,
+      autocorrelated.noise = FALSE
+    )
+    
+    #extracting r-squared
+    models.df[models.df$response_variable == response.i, predictor.group.i] <- mean(model.i$r.squared) - models.df[models.df$response_variable == response.i, "base_model"]
+    
+  }
+}
+```
+

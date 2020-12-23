@@ -1,3 +1,1210 @@
+pca_factors <- function(
+  distance.matrix = NULL,
+  distance.threshold = NULL
+  ){
+  
+  #thresholding distance matrix 
+  if(!is.null(distance.threshold)){
+    distance.matrix[distance.matrix < distance.threshold] <- 0
+  }
+  
+  #computing pca factors
+  pca.factors <- pca(
+    distance.matrix = distance.matrix,
+    colnames.prefix = paste("distance_pca_", 1:ncol(distance.matrix), sep = ""),
+    plot = FALSE
+  )
+  
+}
+
+
+moran <- function(
+  x = NULL,
+  distance.matrix = NULL,
+  distance.threshold = NULL #cases below this distance are considered neighbors
+){
+  
+  #thresholding distance matrix 
+  if(!is.null(distance.threshold)){
+    # distance.matrix[distance.matrix > distance.threshold] <- distance.threshold
+    distance.matrix[distance.matrix < distance.threshold] <- 0
+  }
+  
+  #computing weights
+  weight <- 1/distance.matrix
+  weight[is.infinite(weight)] <- 1
+  diag(weight) <- 0
+  
+  #normalizing weights
+  weight.rowsums <- rowSums(weight)
+  weight.rowsums[weight.rowsums == 0] <- 1
+  weight <- weight/weight.rowsums
+  
+  #computing expected Moran I
+  n <- length(x)
+  expected.moran <- round(-1/(n - 1), 4)
+  
+  #computing observed Moran I
+  s <- sum(weight)
+  m <- mean(x)
+  y <- x - m #centering x
+  cv <- sum(weight * y %o% y)
+  v <- sum(y^2)
+  observed.moran <- (n/s) * (cv/v)
+  i.max <- (n/s) * (sd(rowSums(weight) * y)/sqrt(v/(n - 1)))
+  observed.moran <- round(observed.moran/i.max, 4)
+  
+  #computing p-value
+  s1 <- 0.5 * sum((weight + t(weight))^2)
+  s2 <- sum((apply(weight, 1, sum) + apply(weight, 2, sum))^2)
+  s.sq <- s^2
+  k <- (sum(y^4)/n) / (v/n)^2
+  expected.standard.deviation <- sqrt(
+    (n*((n^2 - 3*n + 3)*s1 - n*s2 + 3*s.sq) - 
+       k*(n*(n - 1)*s1 - 2*n*s2 + 6*s.sq)) / 
+      ((n - 1)*(n - 2)*(n - 3)*s.sq) - 1/((n - 1)^2)
+  )
+  p.value <- pnorm(observed.moran, mean = expected.moran, sd = expected.standard.deviation)
+  p.value <- if (observed.moran <= expected.moran) 2*p.value else 2*(1 - p.value)
+  p.value <- round(p.value, 4)
+  
+  #adding interpretation
+  if(observed.moran > 0 & p.value <= 0.05){
+    interpretation <- "Positive autocorrelation"
+  }
+  if(observed.moran < 0 & p.value <= 0.05){
+    interpretation <- "Negative autocorrelation"
+  }
+  if(p.value > 0.05){
+    interpretation <- "No autocorrelation"
+  }
+  
+  #preparing output
+  out <- data.frame(
+    moran.i = observed.moran,
+    p.value = p.value,
+    interpretation = interpretation
+  )
+  return(out)
+  
+}
+
+
+multiscale_moran <- function(
+  x,
+  distance.matrix,
+  distance.thresholds = NULL,
+  plot = TRUE
+){
+  
+  #creating distance thresholds
+  if(is.null(distance.thresholds) == TRUE){
+    distance.thresholds <- floor(seq(0, max(distance.matrix), length.out = 10))
+  }
+  
+  #create output dataframe
+  out.df <- data.frame(
+    distance.threshold = distance.thresholds,
+    moran.i = NA,
+    moran.p = NA,
+    interpretation = NA
+  )
+  
+  #iterating over out.df
+  for(i in 1:nrow(out.df)){
+    
+    #compute Moran's I
+    moran.out <- moran(
+      x = x, 
+      distance.matrix = distance.matrix,
+      distance.threshold = out.df[i, "distance.threshold"]
+      )
+    
+    out.df[i, "moran.i"] <- moran.out["moran.i"]
+    out.df[i, "moran.p"] <- moran.out["p.value"]
+    out.df[i, "interpretation"] <- moran.out["interpretation"]
+    
+  }
+  
+  p <- ggplot2::ggplot(data = out.df) + 
+    ggplot2::aes(
+      x = distance.threshold,
+      y = moran.i
+    ) + 
+    ggplot2::geom_point() + 
+    ggplot2::geom_line() + 
+    ggplot2::xlab("Neighborhood distance") + 
+    ggplot2::ylab("Moran's I") + 
+    ggplot2::ggtitle("Multiscale Moran's I")
+  
+  #getting scale of max moran
+  neighborhood.max.moran <- out.df[which.max(out.df$moran.i), "distance.threshold"]
+  
+  #preparing output list
+  out.list <- list()
+  out.list$df <- out.df
+  out.list$plot <- p
+  out.list$neighborhood.max.moran <- neighborhood.max.moran
+  
+  if(plot == TRUE){print(p)}
+
+  return(out.list)
+  
+}
+
+pca <- function(
+  distance.matrix, 
+  colnames.prefix = "pca_factor", 
+  plot = TRUE
+  ){
+  x.pca <- prcomp(distance.matrix, scale. = TRUE)
+  
+  if(plot == TRUE){
+    p <- factoextra::fviz_eig(x.pca)
+    print(p)
+  }
+
+  x.pca.factors <- as.data.frame(x.pca$x)
+  colnames(x.pca.factors) <- paste(colnames.prefix, 1:ncol(x.pca.factors), sep = "_")
+  
+  #robust scaling
+  x.pca.factors <- quantable::robustscale(
+    data = x.pca.factors,
+    dim = 2,
+    center = TRUE,
+    scale = TRUE,
+    preserveScale = FALSE
+  )$data
+  
+  return(x.pca.factors)
+}
+
+
+
+statistical_mode <- function(x) {
+  x.unique <- unique(x)
+  x.unique[which.max(tabulate(match(x, x.unique)))]
+  x.unique <- unlist(x.unique[1])
+  return(x.unique)
+}
+
+#modified from https://www.marinedatascience.co/blog/2019/01/07/normalizing-the-rmse/
+root_mean_squared_error <- function(o, p, type = "iq") {
+  
+  squared_sums <- sum((o - p)^2)
+  mse <- squared_sums/length(o)
+  rmse <- round(sqrt(mse), 4)
+  
+  if(is.null(type)){
+    return(rmse)
+    
+  } else {
+    
+    if (!type %in% c("mean", "sd", "maxmin", "iq")) message("Wrong type!")
+    
+    #computing nrmse
+    nrmse.sd <- rmse/sd(o)
+    nrmse.mean <- rmse/mean(o)
+    nrmse.maxmin <- rmse/ (max(o) - min(o))
+    nrmse.iq <- rmse/ (quantile(o, 0.75) - quantile(o, 0.25))
+    
+    #building vector with nrmse values
+    nrmse <- c(nrmse.iq, nrmse.maxmin, nrmse.mean, nrmse.sd)
+    names(nrmse) <- c("iq", "maxmin", "mean", "sd")
+    
+    #removing infinites
+    nrmse[!is.finite(nrmse)] <- NA
+    nrmse <- na.omit(nrmse)
+    
+    #if the selected type has a valid value
+    if(type %in% names(nrmse)){
+      nrmse <- nrmse[names(nrmse) == type]
+    } else {
+      #otherwise return the next one
+      nrmse <- nrmse[1]
+    }
+    
+    return(nrmse)
+  }
+  
+}
+
+repeat_rf <- function(
+  data = NULL,
+  dependent.variable.name = NULL,
+  predictor.variable.names = NULL,
+  distance.matrix = NULL,
+  iterations = 10,
+  white.noise = FALSE,
+  autocorrelated.noise = FALSE,
+  trees.per.variable = 100,
+  ranger.arguments = list(
+    formula = NULL,
+    mtry = NULL,
+    importance = "permutation",
+    write.forest = TRUE,
+    probability = FALSE,
+    min.node.size = NULL,
+    max.depth = NULL,
+    replace = TRUE,
+    case.weights = NULL,
+    class.weights = NULL,
+    splitrule = NULL,
+    num.random.splits = 1,
+    alpha = 0.5,
+    minprop = 0.1,
+    split.select.weights = NULL,
+    always.split.variables = NULL,
+    respect.unordered.factors = NULL,
+    scale.permutation.importance = TRUE,
+    local.importance = FALSE,
+    regularization.factor = 1,
+    regularization.usedepth = FALSE,
+    keep.inbag = FALSE,
+    inbag = NULL,
+    holdout = FALSE,
+    quantreg = FALSE,
+    oob.error = TRUE,
+    num.threads = parallel::detectCores() - 1,
+    save.memory = FALSE,
+    verbose = TRUE,
+    classification = NULL,
+    x = NULL,
+    y = NULL,
+    sample.fraction = 1
+  )
+){
+  
+  #lists to store results of the iterations
+  predictions <- list()
+  variable.importance.local <- list()
+  variable.importance <- list()
+  prediction.error <- list()
+  r.squared <- list()
+  pseudo.r.squared <- list()
+  rmse <- list()
+  nrmse <- list()
+  residuals <- list()
+  residuals.moran <- list()
+  
+  #iterations
+  for(i in 1:iterations){
+    
+    #setting seed
+    set.seed(i)
+    
+    #fitting model
+    m.i <- rf(
+      data = data,
+      dependent.variable.name = dependent.variable.name,
+      predictor.variable.names = predictor.variable.names,
+      distance.matrix = distance.matrix,
+      white.noise = white.noise,
+      autocorrelated.noise = autocorrelated.noise,
+      trees.per.variable = trees.per.variable,
+      seed = i,
+      ranger.arguments = ranger.arguments
+    )
+    
+    #gathering results
+    predictions[[i]] <- m.i$predictions
+    variable.importance.local[[i]] <- m.i$variable.importance.local
+    variable.importance[[i]] <- m.i$variable.importance
+    prediction.error[[i]] <- m.i$prediction.error
+    r.squared[[i]] <- m.i$r.squared
+    pseudo.r.squared[[i]] <- m.i$pseudo.r.squared
+    rmse[[i]] <- m.i$rmse
+    nrmse[[i]] <- m.i$nrmse
+    residuals[[i]] <- m.i$residuals
+    residuals.moran[[i]] <- m.i$residuals.moran
+      
+  }#end of iterations
+  
+  #fitting complete model to allow plotting partial dependence curves
+  m.curves <- rf(
+    data = data,
+    dependent.variable.name = dependent.variable.name,
+    predictor.variable.names = predictor.variable.names,
+    seed = i,
+    white.noise = FALSE,
+    autocorrelated.noise = FALSE,
+    trees.per.variable = trees.per.variable,
+    ranger.arguments = ranger.arguments
+  )
+  
+  #names of iterations columns
+  iteration.columns <- paste("iteration", 1:iterations, sep = "_")
+  
+  #gathering predictions
+  predictions.by.iteration <- as.data.frame(do.call("cbind", predictions))
+  colnames(predictions.by.iteration) <- iteration.columns
+  predictions.mean <- data.frame(
+    mean = rowMeans(predictions.by.iteration),
+    sd = apply(predictions.by.iteration, 1, sd)
+  )
+  m.curves$predictions <- NULL #to avoid warning
+  m.curves$predictions$by.iteration <- predictions.by.iteration
+  m.curves$predictions$mean <- predictions.mean
+  
+  #gathering variable.importance.local
+  m.curves$variable.importance.local <- apply(simplify2array(variable.importance.local), 1:2, mean)
+  
+  #gathering variable.importance
+  m.curves$variable.importance.df <- NULL
+  
+  variable.importance <- as.data.frame(do.call("cbind", variable.importance))
+  colnames(variable.importance) <- iteration.columns
+  variable.importance <- data.frame(
+    variable = rownames(variable.importance),
+    variable.importance,
+    row.names = NULL
+  )
+  
+  variable.importance.mean <- data.frame(
+    variable = variable.importance$variable,
+    mean = rowMeans(variable.importance[, tidyselect::all_of(iteration.columns)]),
+    sd = apply(variable.importance[, tidyselect::all_of(iteration.columns)], 1, sd),
+    row.names = NULL
+  ) %>% 
+    dplyr::arrange(desc(mean)) %>% 
+    as.data.frame()
+  
+  variable.importance.wide <- as.data.frame(t(variable.importance[, iteration.columns]))
+  colnames(variable.importance.wide) <- variable.importance$variable
+  variable.importance.wide <- variable.importance.wide[, variable.importance.mean$variable]
+
+  variable.importance.long <- tidyr::pivot_longer(
+    data = variable.importance,
+    cols = tidyselect::all_of(iteration.columns),
+    names_to = "iteration",
+    values_to = "importance"
+  ) %>% 
+    as.data.frame()
+  
+  variable.importance.plot <- ggplot2::ggplot(data = variable.importance.long) + 
+    ggplot2::aes(y = reorder(variable, importance), x = importance) + 
+    ggplot2::geom_boxplot() + 
+    ggplot2::ylab("") + 
+    ggplot2::xlab("Importance score") + 
+    ggplot2::ggtitle(paste("Response variable: ", dependent.variable.name, sep = ""))
+  
+  print(variable.importance.plot)
+  
+  m.curves$variable.importance <- list()
+  m.curves$variable.importance$mean <- variable.importance.mean
+  m.curves$variable.importance$wide <- variable.importance.wide
+  m.curves$variable.importance$long <- variable.importance.long
+  m.curves$variable.importance$plot <- variable.importance.plot
+
+  
+  #gathering prediction.error
+  m.curves$prediction.error <- unlist(prediction.error)
+  
+  #gathering r.squared
+  m.curves$r.squared <- unlist(r.squared)
+  
+  #gathering pseudo R squared
+  m.curves$pseudo.r.squared <- unlist(pseudo.r.squared)
+  
+  #gathering rmse
+  m.curves$rmse <- unlist(rmse)
+  
+  #gathering nrmse
+  m.curves$nrmse <- unlist(nrmse)
+  names(m.curves$nrmse) <- NULL
+  
+  #gathering residuals.moran
+  for(i in 1:iterations){
+    residuals.moran[[i]]$plot <- NULL
+    residuals.moran[[i]]$neighborhood.max.moran <- NULL
+    residuals.moran[[i]] <- residuals.moran[[i]]$df
+    residuals.moran[[i]]$iteration <- i
+  }
+  residuals.moran.by.iteration <- do.call("rbind", residuals.moran)
+  
+  residuals.moran.mean <- residuals.moran.by.iteration %>% 
+    dplyr::group_by(distance.threshold) %>% 
+    dplyr::summarise(
+      moran.i = mean(moran.i),
+      p.value = mean(moran.p),
+      interpretation = statistical_mode(interpretation)
+    ) %>% 
+    as.data.frame()
+  
+  p <- ggplot2::ggplot(data = residuals.moran.mean) + 
+    ggplot2::aes(
+      x = distance.threshold,
+      y = moran.i
+    ) + 
+    ggplot2::geom_point() + 
+    ggplot2::geom_line() + 
+    ggplot2::xlab("Neighborhood distance") + 
+    ggplot2::ylab("Moran's I") + 
+    ggplot2::ggtitle("Multiscale Moran's I")
+    
+  m.curves$residuals.moran <- list()
+  m.curves$residuals.moran$by.iteration <- residuals.moran.by.iteration
+  m.curves$residuals.moran$mean <- residuals.moran.mean
+  m.curves$residuals.moran$plot <- p
+  
+  #gathering residuals
+  residuals <- as.data.frame(do.call("cbind", residuals))
+  colnames(residuals) <- iteration.columns
+  
+  residuals.mean <- data.frame(
+    mean = rowMeans(residuals),
+    sd = apply(residuals, 1, sd),
+    row.names = NULL
+  )
+  
+  m.curves$residuals <- NULL
+  m.curves$residuals$mean <- residuals.mean
+  m.curves$residuals$stats <- summary(residuals.mean$mean)
+  m.curves$residuals$by.iteration <- residuals
+
+  #returning results list
+  return(m.curves)
+}
+
+
+
+
+#function to rescale vectors between given bounds
+rescaleVector <- function(x = rnorm(100),
+                          new.min = 0,
+                          new.max = 100,
+                          integer = FALSE){
+  
+  
+  #data extremes
+  old.min = min(x)
+  old.max = max(x)
+  
+  
+  #SCALING VECTOR
+  #----------------------
+  
+  x = ((x - old.min) / (old.max - old.min)) * (new.max - new.min) + new.min
+  
+  
+  #FORCES VECTOR INTO INTEGER
+  #----------------------
+  
+  if(integer == TRUE){
+    x = floor(x)
+  }
+  
+  return(x)
+  
+}
+
+
+
+
+
+#rf model with:
+#pseudo R-squared (cor(observations, predictions))
+#dataframe with variable importance
+#Moran's I of the residuals
+rf <- function(
+  data = NULL,
+  dependent.variable.name = NULL,
+  predictor.variable.names = NULL,
+  seed = NULL,
+  white.noise = FALSE,
+  autocorrelated.noise = FALSE,
+  distance.matrix = NULL,
+  trees.per.variable = NULL,
+  ranger.arguments = list(
+    formula = NULL,
+    mtry = NULL,
+    importance = "permutation",
+    write.forest = TRUE,
+    probability = FALSE,
+    min.node.size = NULL,
+    max.depth = NULL,
+    replace = TRUE,
+    case.weights = NULL,
+    class.weights = NULL,
+    splitrule = NULL,
+    num.random.splits = 1,
+    alpha = 0.5,
+    minprop = 0.1,
+    split.select.weights = NULL,
+    always.split.variables = NULL,
+    respect.unordered.factors = NULL,
+    scale.permutation.importance = TRUE,
+    local.importance = FALSE,
+    regularization.factor = 1,
+    regularization.usedepth = FALSE,
+    keep.inbag = FALSE,
+    inbag = NULL,
+    holdout = FALSE,
+    quantreg = FALSE,
+    oob.error = TRUE,
+    num.threads = parallel::detectCores() - 1,
+    save.memory = FALSE,
+    verbose = TRUE,
+    seed = NULL,
+    classification = NULL,
+    x = NULL,
+    y = NULL,
+    sample.fraction = 1
+  )
+){
+  
+  #subsetting data
+  if(!is.null(data)){
+    
+    if(!is.null(predictor.variable.names) & !is.null(dependent.variable.name)){
+      
+      predictor.variable.names <- predictor.variable.names[predictor.variable.names %in% colnames(data)]
+      data <- data[, c(dependent.variable.name, predictor.variable.names)]
+      
+    }
+    
+    #removing NA
+    data <- na.omit(data)
+    
+  }
+  
+  #default model arguments
+  default.ranger.arguments <- list(
+    formula = NULL,
+    num.trees = 500,
+    trees.per.variable = NULL,
+    mtry = NULL,
+    mtry = NULL,
+    importance = "permutation",
+    write.forest = TRUE,
+    probability = FALSE,
+    min.node.size = NULL,
+    max.depth = NULL,
+    replace = TRUE,
+    case.weights = NULL,
+    class.weights = NULL,
+    splitrule = NULL,
+    num.random.splits = 1,
+    alpha = 0.5,
+    minprop = 0.1,
+    split.select.weights = NULL,
+    always.split.variables = NULL,
+    respect.unordered.factors = NULL,
+    scale.permutation.importance = TRUE,
+    local.importance = FALSE,
+    regularization.factor = 1,
+    regularization.usedepth = FALSE,
+    keep.inbag = FALSE,
+    inbag = NULL,
+    holdout = FALSE,
+    quantreg = FALSE,
+    oob.error = TRUE,
+    num.threads = parallel::detectCores() - 1,
+    save.memory = FALSE,
+    verbose = TRUE,
+    seed = NULL,
+    classification = NULL,
+    x = NULL,
+    y = NULL,
+    sample.fraction = 1
+  )
+  list2env(default.ranger.arguments, envir=environment())
+  
+  #user arguments
+  list2env(ranger.arguments, envir=environment())
+  
+  #setting up seed if available
+  if(!is.null(seed)){
+    set.seed(seed)
+  }
+  
+  if(!is.null(trees.per.variable)){
+    num.trees <- trees.per.variable * (ncol(data) - 1)
+  }
+  
+  #ranger model for r-squared and predictions
+  m <- ranger::ranger(
+    data = data,
+    dependent.variable.name = dependent.variable.name,
+    num.trees = num.trees,
+    mtry = mtry,
+    importance = importance,
+    write.forest = write.forest,
+    probability = probability,
+    min.node.size = min.node.size,
+    max.depth = max.depth,
+    replace = replace,
+    sample.fraction = sample.fraction,
+    case.weights = case.weights,
+    class.weights = class.weights,
+    splitrule = splitrule,
+    num.random.splits = num.random.splits,
+    alpha = alpha,
+    minprop = minprop,
+    split.select.weights = split.select.weights,
+    always.split.variables = always.split.variables,
+    respect.unordered.factors = respect.unordered.factors,
+    scale.permutation.importance = scale.permutation.importance,
+    local.importance = local.importance,
+    regularization.factor = regularization.factor,
+    regularization.usedepth = regularization.usedepth,
+    keep.inbag = keep.inbag,
+    inbag = inbag,
+    holdout = holdout,
+    quantreg = quantreg,
+    oob.error = oob.error,
+    num.threads = num.threads,
+    save.memory = save.memory,
+    verbose = verbose,
+    seed = seed,
+    classification = classification,
+    x = x,
+    y = y
+  )
+  
+  #adding white noise variable
+  if(white.noise == TRUE){
+    data$noise.white <- rnorm(nrow(data))
+  }
+  
+  #adding autocorrelated noise variable
+  if(autocorrelated.noise == TRUE){
+    data$noise.autocorrelated <- as.vector(
+      rescaleVector(
+        stats::filter(
+          rnorm(
+            nrow(data)
+          ),
+          filter = rep(1, sample(1:floor(nrow(data)/2), 1)),
+          method = "convolution",
+          circular = TRUE), 
+        new.max = 1, 
+        new.min = 0
+      )
+    )
+  }
+  
+  #applying robust scaling to the data
+  data.scaled <- quantable::robustscale(
+    data = data,
+    dim = 2,
+    center = TRUE,
+    scale = TRUE,
+    preserveScale = FALSE
+  )$data
+  
+  #if scaling fails, use regular scale
+  if(sum(is.nan(data.scaled[, 1])) > 0 | sum(is.infinite(data.scaled[, 1])) > 0){
+    data.scaled <- as.data.frame(scale(data))
+  }
+  
+  #ranger model for variable importance
+  m.scaled <- ranger::ranger(
+    data = data.scaled,
+    dependent.variable.name = dependent.variable.name,
+    num.trees = num.trees,
+    mtry = mtry,
+    importance = importance,
+    write.forest = write.forest,
+    probability = probability,
+    min.node.size = min.node.size,
+    max.depth = max.depth,
+    replace = replace,
+    sample.fraction = sample.fraction,
+    case.weights = case.weights,
+    class.weights = class.weights,
+    splitrule = splitrule,
+    num.random.splits = num.random.splits,
+    alpha = alpha,
+    minprop = minprop,
+    split.select.weights = split.select.weights,
+    always.split.variables = always.split.variables,
+    respect.unordered.factors = respect.unordered.factors,
+    scale.permutation.importance = scale.permutation.importance,
+    local.importance = local.importance,
+    regularization.factor = regularization.factor,
+    regularization.usedepth = regularization.usedepth,
+    keep.inbag = keep.inbag,
+    inbag = inbag,
+    holdout = holdout,
+    quantreg = quantreg,
+    oob.error = oob.error,
+    num.threads = num.threads,
+    save.memory = save.memory,
+    verbose = verbose,
+    seed = seed,
+    classification = classification,
+    x = x,
+    y = y
+  )
+  
+  #adding model arguments
+  m$ranger.arguments.arguments <- list(
+    dependent.variable.name = dependent.variable.name,
+    num.trees = num.trees,
+    mtry = mtry,
+    importance = importance,
+    write.forest = write.forest,
+    probability = probability,
+    min.node.size = min.node.size,
+    max.depth = max.depth,
+    replace = replace,
+    sample.fraction = sample.fraction,
+    case.weights = case.weights,
+    class.weights = class.weights,
+    splitrule = splitrule,
+    num.random.splits = num.random.splits,
+    alpha = alpha,
+    minprop = minprop,
+    split.select.weights = split.select.weights,
+    always.split.variables = always.split.variables,
+    respect.unordered.factors = respect.unordered.factors,
+    scale.permutation.importance = scale.permutation.importance,
+    local.importance = local.importance,
+    regularization.factor = regularization.factor,
+    regularization.usedepth = regularization.usedepth,
+    keep.inbag = keep.inbag,
+    inbag = inbag,
+    holdout = holdout,
+    quantreg = quantreg,
+    oob.error = oob.error,
+    num.threads = num.threads,
+    save.memory = save.memory,
+    verbose = verbose,
+    seed = seed,
+    classification = classification
+  )
+  
+  #importance dataframe
+  m$variable.importance.df <- data.frame(
+    variable = names(m.scaled$variable.importance),
+    importance = m.scaled$variable.importance
+  ) %>%
+    tibble::remove_rownames() %>%
+    dplyr::arrange(desc(importance))
+  
+  #getting residuals
+  
+  #predicted data
+  predicted <- m$predictions
+  
+  #getting observed data
+  
+  #if data is provided
+  if(!is.null(data)){
+    
+    #the user used a formula
+    if(!is.null(formula)){
+      
+      #observed
+      observed <- data[, all.vars(formula)[1]]
+      
+    }
+    
+    #user gave dependent.variable.name
+    if(!is.null(dependent.variable.name)){
+      
+      #observed
+      observed <- data[, dependent.variable.name]
+      
+    }
+    
+  }
+  
+  if(!is.null(y) & !is.null(x)){
+    
+    observed = y
+    
+  }
+  
+  
+  m$pseudo.r.squared <- cor(
+    observed,
+    predicted
+  )
+  
+  m$rmse <- root_mean_squared_error(
+    o = observed,
+    p = predicted,
+    type = NULL
+  )
+  
+  m$nrmse <- root_mean_squared_error(
+    o = observed,
+    p = predicted,
+    type = "iq"
+  )
+  
+  m$residuals <- observed - predicted
+  
+  
+  #compute moran I of residuals if weighted.distance.matrix is provided
+  if(!is.null(distance.matrix)){
+    
+    m$residuals.moran <- multiscale_moran(
+      x = m$residuals,
+      distance.matrix = distance.matrix,
+      plot = FALSE
+      )
+
+  }
+  
+  #replacing variable importance with the scaled one
+  m$variable.importance <- m.scaled$variable.importance
+  m$variable.importance.local <- m.scaled$variable.importance.local
+  
+  return(m)
+  
+}
+
+
+#computes vif of a dataframe
+vif <- function(x){
+  out <- x %>% 
+    na.omit() %>% 
+    as.matrix() %>% 
+    cor() %>% 
+    solve() %>% 
+    diag() %>% 
+    sort(decreasing = TRUE) %>% 
+    as.data.frame() %>% 
+    tibble::rownames_to_column(var = "variable") 
+  colnames(out)[2] <- "vif"
+  return(out)
+}
+
+#' Correlation dendrogram to help reduce multicollinearity in a training dataset.
+#'
+#' @description Computes the correlation between all pairs of variables in a training dataset and computes a cluster through the expression \code{hclust(as.dist(abs(1 - correlation.matrix)))}. If a \code{\link{s_biserial_cor}} output is provided, the clustering is computed as \code{hclust(as.dist(abs(1 - correlation.matrix)), method = "single")}, and the algorithm selects variables automatically based on the R-squared value obtained by each variable in the biserial correlation analysis.
+#'
+#' @usage cor_dendrogram(
+#'   training.df,
+#'   select.cols = NULL,
+#'   omit.cols = c("x", "y", "presence"),
+#'   max.cor = 0.75,
+#'   biserial.cor = NULL,
+#'   plot = TRUE,
+#'   text.size = 6
+#'   )
+#'
+#'
+#' @param training.df A data frame with a presence column with 1 indicating presence and 0 indicating background, and columns with predictor values.
+#' @param select.cols Character vector, names of the columns representing predictors. If \code{NULL}, all numeric variables but \code{presence.column} are considered.
+#' @param omit.cols Character vector, variables to exclude from the analysis. Defaults to \code{c("x", "y", "presence")}.
+#' @param max.cor Numeric in the interval [0, 1], maximum Pearson correlation of the selected variables. Defaults to 0.75.
+#' @param biserial.cor List, output of the function \code{\link{s_biserial_cor}}. Its R-squared scores are used to select variables.
+#' @param plot Boolean, prints biserial correlation plot if \code{TRUE}.
+#' @param text.size Numeric, size of the dendrogram labels.
+#'
+#' @return If \code{biserial.cor} is not NULL, a list with two slots named "dendrogram" (a ggplot2 object) and "selected.variables" with the dendrogram and the character vector with the selected variables. Otherwise it only returns the dendrogram, and the users have to select the variables by themselves.
+#'
+#' @examples
+#' \dontrun{
+#'data("virtualSpeciesPB")
+#'
+#'biserial.cor <- s_biserial_cor(
+#'  training.df = virtualSpeciesPB,
+#'  omit.cols = c("x", "y")
+#')
+#'
+#'selected.vars <- cor_dendrogram(
+#'  training.df = virtualSpeciesPB,
+#'  select.cols = NULL,
+#'  omit.cols = c("x", "y", "presence"),
+#'  max.cor = 0.75,
+#'  biserial.cor = biserial.cor
+#')$selected.variables
+#'}
+#'
+#' @author Blas Benito <blasbenito@gmail.com>.
+#'
+#' @export
+cor_dendrogram <- function(
+  training.df,
+  select.cols = NULL,
+  omit.cols = c("x", "y", "presence"),
+  max.cor = 0.75,
+  biserial.cor = NULL,
+  plot = TRUE,
+  text.size = 4
+){
+  
+  #preparing output list
+  output.list <- list()
+  
+  #dropping omit.cols
+  if(sum(omit.cols %in% colnames(training.df)) == length(omit.cols)){
+    training.df <-
+      training.df %>%
+      dplyr::select(-tidyselect::all_of(omit.cols))
+  }
+  
+  #selecting select.cols
+  if(is.null(select.cols) == FALSE){
+    if(sum(select.cols %in% colnames(training.df)) == length(select.cols)){
+      training.df <-
+        training.df %>%
+        dplyr::select(tidyselect::all_of(select.cols))
+    }
+  }
+  
+  #getting numeric columns only and removing cases with NA
+  training.df <-
+    training.df[, unlist(lapply(training.df, is.numeric))] %>%
+    na.omit()
+  
+  #computes correlation matrix
+  cor.matrix <-
+    training.df %>%
+    cor() %>%
+    as.dist() %>%
+    abs()
+  
+  #if biserial.cor == NULL
+  #-------------------------------------
+  if(is.null(biserial.cor) == TRUE | inherits(biserial.cor, "s_biserial_cor") == FALSE){
+    
+    #cluster (converts correlation to distance)
+    temp.cluster <- hclust(1 - cor.matrix)
+    
+    #generates cluster data
+    temp.cluster.data <- ggdendro::dendro_data(temp.cluster)
+    
+    #plots cluster
+    cluster.plot <- ggplot2::ggplot() +
+      ggplot2::geom_segment(
+        data = ggdendro::segment(temp.cluster.data),
+        aes(
+          x = x,
+          y = y,
+          xend = xend,
+          yend = yend)
+      ) +
+      ggplot2::geom_text(
+        data = ggdendro::label(temp.cluster.data),
+        aes(
+          label = label,
+          x = x,
+          y = 0,
+          hjust = 1
+        ),
+        size = text.size
+      ) +
+      ggplot2::coord_flip(ylim = c(-0.4, 1)) +
+      viridis::scale_colour_viridis(direction = -1, end = 0.9)  +
+      ggplot2::theme(
+        axis.text.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank(),
+        plot.margin = unit(c(1,2,1,2), "lines"),
+        axis.text.x = element_text(size = text.size * 2),
+        legend.position = "bottom",
+        legend.key.width = unit(2, "lines")
+      ) +
+      ggplot2::labs(colour = "R2") +
+      ggplot2::geom_hline(
+        yintercept = 1 - max.cor,
+        col = "red4",
+        linetype = "dashed",
+        size = 1,
+        alpha = 0.5
+      ) +
+      ggplot2::scale_y_continuous(breaks = c(1 - max.cor, 0, 0.25, 0.5, 0.75, 1)) +
+      ggplot2::ylab("1 - correlation")
+    
+    if(plot == TRUE){
+      ggplot2::theme_set(cowplot::theme_cowplot())
+      print(cluster.plot)
+    }
+    
+    #prepare output
+    selected.variables <- colnames(training.df)
+    
+  } else {
+    
+    #cluster (converts correlation to distance)
+    temp.cluster <- hclust(1 - cor.matrix, method = "single")
+    
+    #gets range of heights of the cluster
+    height.range <- round(range(temp.cluster$height), 2)
+    
+    #gets change step
+    height.step <- (max(height.range) - min(height.range))/200
+    
+    #initial value for observed.max.cor
+    observed.max.cor <- 1
+    
+    #iterator counter
+    i <- 0
+    
+    #iterations to find right height
+    while(observed.max.cor > max.cor){
+      
+      #plus one iteration
+      i <- i + 1
+      
+      #computes height cutoff
+      height.cutoff <- min(height.range) + (height.step * i)
+      
+      #table of groups
+      temp.cluster.groups <- data.frame(group = cutree(
+        temp.cluster,
+        h = height.cutoff
+      ))
+      temp.cluster.groups$variable <- row.names(temp.cluster.groups)
+      temp.cluster.groups <- temp.cluster.groups[
+        order(
+          temp.cluster.groups$group,
+          decreasing = FALSE
+        ), ]
+      row.names(temp.cluster.groups) <- 1:nrow(temp.cluster.groups)
+      
+      #adds biserial correlation to cluster labels
+      temp.cluster.groups$R2 <- biserial.cor$df[
+        match(
+          temp.cluster.groups$variable,     #cluster labels
+          biserial.cor$df$variable #variables in biserial correlation output
+        ), "R2"
+      ]
+      
+      #gets the maximum of each group
+      selected.variables <-
+        temp.cluster.groups %>%
+        dplyr::group_by(group) %>%
+        dplyr::slice(which.max(R2)) %>%
+        .$variable
+      
+      #computes observed max cor
+      observed.max.cor <-
+        training.df[, selected.variables] %>%
+        cor() %>%
+        as.dist() %>%
+        as.vector() %>%
+        abs() %>%
+        max()
+      
+      observed.max.cor
+      
+    }#end of while
+    
+    
+    #prepares cluster plotting
+    temp.cluster.data <- ggdendro::dendro_data(temp.cluster)
+    
+    #gets R2
+    temp.cluster.data$labels$R2 <- biserial.cor$df[
+      match(
+        temp.cluster.data$labels$label, #cluster labels
+        biserial.cor$df$variable        #variables biserial.cor
+      ), "R2"
+    ]
+    
+    #gets labels
+    labs <- ggdendro::label(temp.cluster.data)
+    
+    #adds arrow to label if the variable is selected
+    labs$label <- as.character(labs$label)
+    for(i in 1:nrow(labs)){
+      if(labs[i, "label"] %in% selected.variables){
+        labs[i, "label"] <- paste("\u{2192} ", labs[i, "label"], sep = "")
+      }
+    }
+    labs$label <- factor(labs$label)
+    
+    
+    #plots dendrogram
+    cluster.plot <- ggplot2::ggplot() +
+      ggplot2::geom_segment(
+        data = ggdendro::segment(temp.cluster.data),
+        aes(
+          x = x,
+          y = y,
+          xend = xend,
+          yend = yend)
+      ) +
+      ggplot2::geom_text(
+        data = ggdendro::label(temp.cluster.data),
+        aes(
+          label = labs$label,
+          x = x,
+          y = 0,
+          colour = labs$R2,
+          hjust = 1
+        ),
+        size = text.size
+      ) +
+      ggplot2::coord_flip(ylim = c(-(max(height.range)/2), max(height.range))) +
+      viridis::scale_colour_viridis(direction = -1, end = 0.9)  +
+      ggplot2::theme(
+        axis.text.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank(),
+        plot.margin = unit(c(2,2,2,2), "lines"),
+        axis.text.x = element_text(size = text.size * 2),
+        legend.position = "bottom",
+        legend.key.width = unit(2, "lines")
+      ) +
+      ggplot2::labs(colour = "Biserial correlation") +
+      ggplot2::geom_hline(
+        yintercept = height.cutoff,
+        col = "red4",
+        linetype = "dashed",
+        size = 1,
+        alpha = 0.5
+      ) +
+      ggplot2::scale_y_continuous(breaks = c(1 - (max(height.range) / 2), 0, 0.25, 0.5, 0.75, 1)) +
+      ggplot2::ylab("Correlation difference")
+    
+    if(plot == TRUE){
+      ggplot2::theme_set(cowplot::theme_cowplot())
+      print(cluster.plot)
+    }
+    
+  }
+  
+  #preparing output
+  output.list$plot <- cluster.plot
+  output.list$vars <- selected.variables
+  return(output.list)
+  
+}
+
+
+#plot map and histogram of a variable in ecoregions
+plot_variable_distribution <- function(
+  ecoregions_polygons,
+  ecoregions,
+  variable = bias_records_per_km2,
+  title = "Records per km2",
+  viridis.direction = 1,
+  binwidth = 1){
+  
+  pa <- ggplot2::ggplot(data = ecoregions_polygons) +
+    ggplot2::geom_sf(aes_string(fill = variable), size = 0.1) +
+    ggplot2::scale_fill_viridis_c(direction = viridis.direction) + 
+    ggplot2::theme(legend.position = "right", legend.key.height = unit(0.5, "cm")) + 
+    ggplot2::ggtitle(title) + 
+    ggplot2::labs(fill = "")
+  
+  pb <- ggplot2::ggplot(data = ecoregions) +
+    ggplot2::geom_histogram(aes_string(
+      x = variable, 
+      fill = factor(ecoregions[, variable])
+    ), binwidth = binwidth
+    ) +
+    ggplot2::scale_fill_viridis_d(direction = viridis.direction) + 
+    ggplot2::theme(legend.position = "none") + 
+    ggplot2::ylab("") + 
+    ggplot2::xlab("")
+  
+  p <- pa | pb
+  
+  return(p)
+  
+}
+
 nball_volume <- function(n, r)
 {
   return(pi^(n/2) * r^n / gamma(n/2+1))
@@ -307,7 +1514,7 @@ betadiversity <- function(
   R. <- abs((a. + b.) - (a. + c.))
   
   #composition similarity
-  C <- (b + c) / a
+  # C <- (b + c) / a
   
   #Sorensen similarity index
   Bsor <- 1 - (2 * a / (2 * a + b + c))
@@ -326,7 +1533,7 @@ betadiversity <- function(
   out.list$c_percent <- c.
   out.list$R <- R
   out.list$R_percent <- R.
-  out.list$C <- C
+  # out.list$C <- C
   out.list$Bsor <- Bsor
   out.list$Bsim <- Bsim
   

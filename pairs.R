@@ -901,4 +901,4 @@ for(i in 1:nrow(ecoregions_pairs)){
   
 }
 
-save(ecoregions, ecoregions_pairs, file = "ecoregions_data.RData")
+save(ecoregions, ecoregions_pairs, file = "ecoregions_plant_diversity.RData")

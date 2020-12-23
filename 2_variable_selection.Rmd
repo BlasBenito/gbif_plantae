@@ -1,0 +1,868 @@
+---
+title: "Variable selection"
+output: html_notebook
+---
+
+```{r, echo = FALSE}
+#automatic install of packages if they are not readily available
+list.of.packages <- c(
+  "tidyverse", 
+  "ggplot2",
+  "patchwork",
+  "sf",
+  "viridis",
+  "kableExtra",
+  "ggcorrplot",
+  "sp",
+  "spdep",
+  "adespatial",
+  "RSpectra",
+  "Matrix",
+  "parallel",
+  "doParallel",
+  "foreach",
+  "factoextra",
+  "ape"
+  )
+
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+
+#installing missing packages
+if(length(new.packages) > 0){
+  install.packages(new.packages, dep=TRUE)
+}
+
+#loading packages
+for(package.i in list.of.packages){
+  suppressPackageStartupMessages(library(package.i, character.only = TRUE))
+}
+
+
+#loading functions
+source("functions.R")
+
+#removing scientific notation
+options(scipen = 9999)
+
+#setting ggplot2 theme
+ggplot2::theme_set(theme_bw())
+
+#loading data
+load("ecoregions_plant_diversity.RData")
+
+rm(list.of.packages, new.packages, package.i)
+```
+
+# The data
+
+## ecoregions
+
+Here I focus on the world's ecoregions with an area equal or larger than 10.000 squared kilometers and that are at least at 1000 kilometers from any other ecoregion. These 664 ecoregions are represented once per row in the dataset `ecoregions`, that has 257 columns following this structure:
+
+-   Columns relative to the ecoregion identification, named `ecoregion_x` describing the name, biome, realm, continent and area of the ecoregion in squared kilometers.
+-   Columns with proxies of bias in the species data of the ecoregions, named `bias_x`, with the number of records, records per area unit, number of species per record, and number of species per record per squared kilometre.
+-   Columns relative to plant species richness, named `richness_x`, with richness values for diferent taxonomic levels (from species to family) for different groups of plants (all plants, vascular plants, trees, and grasses).
+-   Columns named \`rarity_x\`\` with *rarity-weighted richness* values (sum of 1 divided by the number of presences of each species present in the ecoregion, and sum of 1 divided by the number of ecoregions in which each species can be found) for different taxonomic groups (all plants, vascular plants, trees, and grasses) and different taxonomic levels (species and genus).
+-   Columns named `exclusive_x` with the number and percentage of exclusive taxa of the given ecoregion for different plant groups and taxonomic levels.
+-   Features of the ecoregion's neighbors (either direct neighbors, or other ecoregions within 100km when the ecoregion is isolated by the ocean), with columns named `neighbors_x`, containing values such as the number of neighbors, the sum of the neighbor's area, the total percentage of shared edge with those neighbors, their average aridity, and their number of species, genera, classes, and vamilies.
+-   Columns describing the impact of human activity in the ecoregion, named `human_x`, including the conservation assessment by Dinerstein et al. (2017), the human footpring (Sanders citation), and the human population (SIEDAC citation).
+-   Columns named `climate_x` describing the average climatic conditions within a given ecoregion.
+-   Columns named `landcover_x` representing cover percentage of bare soil, herbs and trees (citation modis continuous fields) and NDVI (citation of modis product).
+-   Geography columns named `geo_x` with the range and average of the latitude and longitude of each ecoregion.
+-   Columns representing elevation stats, named `topography_elevation_x`.
+-   A complete set of columns named `fragmentation_x` describing the fragmentation of each ecoregion computed at 5km resolution with the package `landscapemetrics` (citation).
+-   Betadiversity measures (columns are named `betadiversity_x`) between each given ecoregion and its neighbors for different taxonomic levels and plant groups.
+
+```{r, fig.width = 12, fig.height=6, echo = FALSE, fig.cap="Species richness of vascular plants by ecoregion"}
+ggplot2::ggplot(data = ecoregions_polygons) +
+    ggplot2::geom_sf(aes(fill = richness_species_vascular), size = 0.1) +
+    ggplot2::scale_fill_viridis_c() + 
+    ggplot2::labs(fill = "Richness species")
+```
+```{r, fig.width = 12, fig.height=6, echo = FALSE, fig.cap="Species richness of trees by ecoregion"}
+ggplot2::ggplot(data = ecoregions_polygons) +
+    ggplot2::geom_sf(aes(fill = richness_species_trees), size = 0.1) +
+    ggplot2::scale_fill_viridis_c() + 
+    ggplot2::labs(fill = "Tree richness")
+```
+```{r, fig.width = 12, fig.height=6, echo = FALSE, fig.cap="Species richness of grasses (Poaceae) by ecoregion"}
+ggplot2::ggplot(data = ecoregions_polygons) +
+    ggplot2::geom_sf(aes(fill = richness_species_grasses), size = 0.1) +
+    ggplot2::scale_fill_viridis_c() + 
+    ggplot2::labs(fill = "Grasses richness")
+```
+
+## ecoregions_pairs
+
+
+Each ecoregion in `ecoregions` is paired with all the other ecoregions in the table `ecoregions_pairs`, that has 4440232 rows and 170 columns. This table is organized in several groups of columns. As a general rule, the features of a target ecoregion are named `ecoregion_x` while the features of its pair are named `neighbor_x`.
+
+-   `ecoregion_name` and `neighbor_name`: names of the pair.
+-   `ecoregion_area` and `neighbor_area`: area in squared kilometres of each ecoregion in the pair.
+-   `ecoregion_climate_aridity_index_average` and `neighbor_climate_aridity_index_average`: the average aridity index of each ecoregion in the pair.
+-   The `x_geo_x` columns contain the average latitude and longitude of each ecoregion pair, so basically these are the ecoregion centroids.
+-   The columns `x_toporgraphy_elevation_average` contain the average elevation values of each ecoregion.
+-   The columns `connection_x` are data on the connectivity between both ecoregions in the pair. Questions such as "is the pair of ecoregions in the same biome/continent?", or "are they direct neighbors?", and the length of the shared edge when they are neighbors are answered by the data in these columns.
+-   The columns `richness_x_diff` have the differences in richness for each pair of ecoregions.
+-   The columns `climate_x_diff`, `human_x_diff`, `landcover_x_diff`, and `topography_elevation_diff` represent differences in mean climatic, human activity, landcover, and elevation values between ecoregions pairs.
+-   The columns `betadiversity_x` represent betadiversity values between each ecoregion pair for different taxonomic levels.
+-   The overlap in the environmental space, or lack thereof, for each pair of ecoregions is stored in the columns `environmental_overlap_x`.
+
+```{r, fig.width = 9, fig.height = 5, echo = FALSE, fig.cap="Subset of ecoregions_pairs centered on the Gibson desert"}
+#subsetting the table
+plot.df <- ecoregions_pairs %>% 
+  dplyr::filter(
+    ecoregion_name == "Gibson desert",
+    neighbor_name %in% ecoregions[ecoregions$ecoregion_continent == "Oceania", "ecoregion_name"]
+  )
+
+#network plot
+#plotting airport network
+p1 <- ggplot2::ggplot(data = ecoregions_polygons[ecoregions_polygons$ecoregion_continent == "Oceania", ]) +
+  ggplot2::geom_sf() +
+  ggplot2::geom_segment(
+    data = plot.df, aes(
+    x = ecoregion_geo_longitude_average,
+    xend = neighbor_geo_longitude_average,
+    y = ecoregion_geo_latitude_average,
+    yend = neighbor_geo_latitude_average,
+    color = betadiversity_a_percent_families_vascular
+  ),
+  size = 1
+  ) +
+  ggplot2::scale_color_viridis_c(direction = -1) + 
+  ggplot2::xlab("Longitude") +
+  ggplot2::ylab("Latitude") +
+  ggplot2::coord_sf(xlim = c(110, 175)) +
+  ggplot2::labs(color = expression(paste("% shared families \n of vascular plants")))
+print(p1)
+rm(p1, plot.df)
+```
+
+# Assessing bias
+
+There are four indicators of bias in the `ecoregions` dataset:
+
+  + `bias_area_km2`: area of the ecoregion in squared kilometers.
+  + `bias_records`: Number of spatial records available for any species in the GBIF *Plantae* dataset for the given ecoregion. 
+  + `bias_records_per_km2`: Number of GBIF records per squared kilometer. Gives an idea of the density of the spatial sampling of the ecoregion. A low number indicates that the ecoregion has not been sample thoroughly, or that the data available in GBIF Plantae might be missing data from such ecoregion.
+  + `bias_species_per_record`: Represents the number of species discovered per presence record available. A high number indicates that the ecoregion is likely poorly sampled. However, it also indicates that the sampling is diverse, that is, it is not focused in a particular group of species, which at the end might lead to a representative species pool in some cases.
+  + `bias_species_per_record_per_km2`: Computed as `bias_species_per_record / bias_records_per_km2`, it represents the most complete bias measure available for the `ecoregions` dataset.
+  
+```{r}
+temp.df <- dplyr::select(
+  ecoregions,
+  ecoregion_name,
+  richness_species_vascular,
+  ecoregion_area_km2,
+  bias_records,
+  bias_records_per_km2,
+  bias_species_per_record,
+  bias_species_per_record_per_km2
+) %>% 
+  dplyr::mutate(
+   ecoregion_area_km2 = round(ecoregion_area_km2, 0),
+   bias_records_per_km2 = round(bias_records_per_km2, 4),
+   bias_species_per_record = round(bias_species_per_record, 4),
+   bias_species_per_record_per_km2 = round(bias_species_per_record_per_km2, 4)
+  ) %>% 
+ dplyr::arrange(desc(bias_species_per_record_per_km2))
+
+kableExtra::kable(temp.df[1:10, ], caption = "The 10 ecoregions with a higher potential bias.") %>% kableExtra::kable_styling()
+rm(temp.df)
+```
+  
+```{r, fig.width = 12, fig.height = 9, fig.cap="Bias columns in ecoregions", echo = FALSE}
+p1 <- plot_variable_distribution(
+  ecoregions_polygons,
+  ecoregions,
+  variable = "bias_records",
+  title = "Records",
+  viridis.direction = -1,
+  binwidth = 10000
+  )
+
+p2 <- plot_variable_distribution(
+  ecoregions_polygons,
+  ecoregions,
+  variable = "bias_records_per_km2",
+  title = "Records/km2",
+  viridis.direction = -1,
+  binwidth = 1
+  )
+
+p3 <- plot_variable_distribution(
+  ecoregions_polygons,
+  ecoregions,
+  variable = "bias_species_per_record",
+  title = "Species/records",
+  binwidth = 0.05
+  )
+
+p4 <- plot_variable_distribution(
+  ecoregions_polygons,
+  ecoregions,
+  variable = "bias_species_per_record_per_km2",
+  title = "Species/(records/km)",
+  binwidth = 100
+  )
+
+p1 / p2 / p3 / p4 + plot_annotation(tag_levels = 'a')
+rm(p1, p2, p3, p4)
+```
+
+According to the `bias` columns, there is a small set of ecoregions that are *hyper-sampled*, especially in central europe (panels *a* and *b* in Figure 3). A small number of ecoregions, mostly drylands in the central Sahara and Eurasia, are close to one species per record, indicating that these ecoregions are *under-sampled*, and most likely plant taxa might be missing from their species lists (panels *c* and *d* in Figure 3). Finally, when assessing the overall bias through the species per record per kilometer we can see that most ecoregions have an adequate sampling, except for hyperarid regions of the Sahara, the Alashan plateau semi-desert, the East Siberian taiga, and a few others in the eastern shores of the Caspian Sea.
+
+Considering how skewed most bias measures are, I believe that `bias_species_per_record` is the most informative variable regarding the potential incompleteness of species list for understampled ecoregions. As such, the bias variables selected are `bias_area_km2`, since area is an important covariate with the species richness of any region, and `bias_species_per_record`.
+
+```{r}
+bias.variables <- c(
+  "bias_area_km2",
+  "bias_species_per_record"
+)
+```
+
+
+## Organizing the data in lists
+
+To avoid cluttering the R environment with objects, here I organize the datasets `ecoregions` and `ecoregions_pairs` in two lists with their respective names, that also store information about the names of the response variables and predictors of each conceptual group.
+
+```{r, echo = FALSE}
+#organizing the ecoregions data
+
+#renaming ecoregion_area_km2 as bias_area_km2
+ecoregions <- dplyr::rename(
+  ecoregions,
+  bias_area_km2 = ecoregion_area_km2
+)
+
+#copy of ecoregions
+ecoregions.data <- ecoregions
+
+#as a list
+ecoregions <- list()
+
+#adding dataframe
+ecoregions$data <- ecoregions.data
+
+#column names
+ecoregions$names <- colnames(ecoregions$data)
+
+#names of response variables
+ecoregions$response.variables$richness <- ecoregions$names[grepl("^richness", ecoregions$names)]
+ecoregions$response.variables$rarity.weighted.richness <- ecoregions$names[grepl("^rarity_weighted_richness", ecoregions$names)]
+ecoregions$response.variables$mean.rarity <- ecoregions$names[grepl("^mean_rarity", ecoregions$names)]
+ecoregions$response.variables$exclusive <- ecoregions$names[grepl("^exclusive", ecoregions$names)]
+ecoregions$response.variables$betadiversity <- unique(c(
+  ecoregions$names[grepl("^betadiversity_a", ecoregions$names)],
+  ecoregions$names[grepl("^betadiversity_a_percent", ecoregions$names)],
+  ecoregions$names[grepl("^betadiversity_Bsor", ecoregions$names)],
+  ecoregions$names[grepl("^betadiversity_Bsim", ecoregions$names)],
+  ecoregions$names[grepl("^betadiversity_R", ecoregions$names)],
+  ecoregions$names[grepl("^betadiversity_R_percent", ecoregions$names)]
+  ))
+ecoregions$response.variables$all <- c(
+  ecoregions$response.variables$richness,
+  ecoregions$response.variables$rarity.weighted.richness,
+  ecoregions$response.variables$mean.rarity,
+  ecoregions$response.variables$exclusive,
+  ecoregions$response.variables$betadiversity
+)
+
+#selecting predictors
+ecoregions$predictive.variables$bias <- bias.variables
+ecoregions$predictive.variables$neighbors <- ecoregions$names[grepl("^neighbors", ecoregions$names)]
+ecoregions$predictive.variables$human <- ecoregions$names[grepl("^human", ecoregions$names)]
+ecoregions$predictive.variables$climate <- ecoregions$names[grepl("^climate", ecoregions$names)]
+ecoregions$predictive.variables$landcover <- ecoregions$names[grepl("^landcover", ecoregions$names)]
+ecoregions$predictive.variables$topography <- ecoregions$names[grepl("^topography", ecoregions$names)]
+ecoregions$predictive.variables$fragmentation <- ecoregions$names[grepl("^fragmentation", ecoregions$names)]
+ecoregions$predictive.variables$all <- c(
+  ecoregions$predictive.variables$bias,
+  ecoregions$predictive.variables$neighbors,
+  ecoregions$predictive.variables$human,
+  ecoregions$predictive.variables$climate,
+  ecoregions$predictive.variables$landcover,
+  ecoregions$predictive.variables$topography,
+  ecoregions$predictive.variables$fragmentation
+)
+
+#adding centroids
+sf::st_geometry(ecoregions_centroids) <- "geom_centroids"
+ecoregions$centroids <- ecoregions_centroids
+ecoregions$polygons <- ecoregions_polygons
+
+rm(ecoregions_centroids, ecoregions_polygons, ecoregions.data)
+```
+
+```{r}
+#organizing the ecoregions_pairs data
+ecoregions_pairs.data <- ecoregions_pairs
+
+#creating list
+ecoregions_pairs <- list()
+
+#adding the data
+ecoregions_pairs$data <- ecoregions_pairs.data
+
+#column names
+ecoregions_pairs$names <- colnames(ecoregions_pairs$data)
+
+#names of response variables
+ecoregions_pairs$response.variables$richness <- ecoregions_pairs$names[grepl("^richness", ecoregions_pairs$names)]
+ecoregions_pairs$response.variables$betadiversity <- unique(c(
+  ecoregions$names[grepl("^betadiversity_a", ecoregions$names)],
+  ecoregions$names[grepl("^betadiversity_a_percent", ecoregions$names)],
+  ecoregions_pairs$names[grepl("^betadiversity_Bsor", ecoregions_pairs$names)],
+  ecoregions_pairs$names[grepl("^betadiversity_Bsim", ecoregions_pairs$names)],
+  ecoregions_pairs$names[grepl("^betadiversity_R", ecoregions_pairs$names)],
+  ecoregions_pairs$names[grepl("^betadiversity_R_percent", ecoregions_pairs$names)]
+  ))
+ecoregions_pairs$response.variables$all <- c(
+  ecoregions_pairs$response.variables$richness,
+  ecoregions_pairs$response.variables$betadiversity
+)
+
+#selecting predictors
+ecoregions_pairs$predictive.variables$connection <- ecoregions_pairs$names[grepl("^connection", ecoregions_pairs$names)]
+ecoregions_pairs$predictive.variables$human <- ecoregions_pairs$names[grepl("^diff_human", ecoregions_pairs$names)]
+ecoregions_pairs$predictive.variables$climate <- ecoregions_pairs$names[grepl("^diff_climate", ecoregions_pairs$names)]
+ecoregions_pairs$predictive.variables$landcover <- ecoregions_pairs$names[grepl("^diff_landcover", ecoregions_pairs$names)]
+ecoregions_pairs$predictive.variables$topography <- ecoregions_pairs$names[grepl("^diff_topography", ecoregions_pairs$names)]
+ecoregions_pairs$predictive.variables$overlap <- ecoregions_pairs$names[grepl("^environmental", ecoregions_pairs$names)]
+ecoregions_pairs$predictive.variables$autocorrelation <- NA
+ecoregions_pairs$predictive.variables$all <- c(
+  ecoregions_pairs$predictive.variables$connection,
+  ecoregions_pairs$predictive.variables$human,
+  ecoregions_pairs$predictive.variables$climate,
+  ecoregions_pairs$predictive.variables$landcover,
+  ecoregions_pairs$predictive.variables$topography,
+  ecoregions_pairs$predictive.variables$overlap
+)
+
+rm(ecoregions_pairs.data)
+```
+
+# Understanding the relationship between response variables
+
+## `ecoregions` dataset
+
+In the `ecoregions` dataset there are several groups of response variables computed for different taxonomic levels, and relationships among these variables are to be expected. Understanding these relationships will help downstream in understanding why models for different response variables show similar structures.
+
+```{r, fig.width=9, fig.height=6, fig.cap="Correlogram between diversity variables for vascular species."}
+temp.df <- ecoregions$data[, c(
+  "richness_species_vascular",
+  "rarity_weighted_richness_species_vascular",
+  "mean_rarity_species_vascular",
+  "exclusive_percent_species_vascular",
+  "betadiversity_a_species_vascular",
+  "betadiversity_a_percent_species_vascular",
+  "betadiversity_Bsim_species_vascular",
+  "betadiversity_R_species_vascular",
+  "betadiversity_R_percent_species_vascular"
+)] %>% 
+  scale() %>% 
+  as.data.frame()
+
+ggcorrplot(
+  cor(temp.df), 
+  hc.order = TRUE, 
+  type = "lower",
+   lab = TRUE
+  )
+```
+The correlogram shows that three pairs of response variables are highly positively correlated:
+
+  + `mean_rarity_species_vascular` and `exclusive_percent_species_vascular`.
+  + `rarity_weighted_richness_species_vascular` and `betadiversity_a_species_vascular`.
+  + `richness_species_vascular` and `rarity_weighted_richness_species_vascular`
+  + `richness_species_vascular` and `betadiversity_a_species_vascular`.
+
+One pair is highly negatively correlated:
+
+  + `betadiversity_R_percent_species_vascular` and `betadiversity_a_percent_species_vascular`
+  
+```{r, fig.width=12, fig.height=9}
+p1 <- ggplot2::ggplot(data = temp.df) + 
+  ggplot2::aes(
+    x = mean_rarity_species_vascular,
+    y = exclusive_percent_species_vascular
+    ) + 
+  ggplot2::geom_point(alpha = 0.3) +
+  ggplot2::coord_fixed(ratio = 1) +
+  ggplot2::geom_abline(intercept = 0, slope = 1, col = "red4")
+
+p2 <- ggplot2::ggplot(data = temp.df) + 
+  ggplot2::aes(
+    x = rarity_weighted_richness_species_vascular,
+    y = betadiversity_a_species_vascular
+    ) + 
+  ggplot2::geom_point(alpha = 0.3) +
+  ggplot2::coord_fixed(ratio = 1) +
+  ggplot2::geom_abline(intercept = 0, slope = 1, col = "red4")
+
+p3 <- ggplot2::ggplot(data = temp.df) + 
+  ggplot2::aes(
+    x = richness_species_vascular,
+    y = rarity_weighted_richness_species_vascular
+    ) + 
+  ggplot2::geom_point(alpha = 0.3) +
+  ggplot2::coord_fixed(ratio = 1) +
+  ggplot2::geom_abline(intercept = 0, slope = 1, col = "red4")
+
+p4 <- ggplot2::ggplot(data = temp.df) + 
+  ggplot2::aes(
+    x = richness_species_vascular,
+    y = betadiversity_a_species_vascular
+    ) + 
+  ggplot2::geom_point(alpha = 0.3) +
+  ggplot2::coord_fixed(ratio = 1) +
+  ggplot2::geom_abline(intercept = 0, slope = 1, col = "red4")
+
+p5 <- ggplot2::ggplot(data = temp.df) + 
+  ggplot2::aes(
+    x = betadiversity_R_percent_species_vascular,
+    y = betadiversity_a_percent_species_vascular
+    ) + 
+  ggplot2::geom_point(alpha = 0.3) +
+  ggplot2::coord_fixed(ratio = 1) +
+  ggplot2::geom_abline(intercept = 0, slope = -1, col = "red4")
+
+(p1 | p2 | p3) / (p4 | p5)
+
+rm(p1, p2, p3, p4, p5, temp.df)
+```
+
+Considering these correlations, only `betadiversity_a_x` and `betadiversity_R_percent` seem to perfectly mirror other variables, and therefore I remove them from the pool of response variables.
+
+```{r}
+#re-doing the betadiversity response variables
+ecoregions$response.variables$betadiversity <- unique(c(
+  ecoregions$names[grepl("^betadiversity_a_percent", ecoregions$names)],
+  ecoregions$names[grepl("^betadiversity_Bsor", ecoregions$names)],
+  ecoregions$names[grepl("^betadiversity_Bsim", ecoregions$names)],
+  ecoregions$names[grepl("^betadiversity_R", ecoregions$names)][!(ecoregions$names[grepl("^betadiversity_R", ecoregions$names)] %in% ecoregions$names[grepl("^betadiversity_R_percent", ecoregions$names)])]
+  ))
+ecoregions$response.variables$all <- c(
+  ecoregions$response.variables$richness,
+  ecoregions$response.variables$rarity.weighted.richness,
+  ecoregions$response.variables$exclusive,
+  ecoregions$response.variables$mean.rarity,
+  ecoregions$response.variables$betadiversity
+)
+```
+
+
+## ecoregions_pairs
+
+Here I repeat the operation for the table `ecoregions_pairs`.
+
+```{r, fig.width=9, fig.height=6, fig.cap="Correlogram between diversity variables for vascular species."}
+temp.df <- ecoregions_pairs$data[, c(
+  "diff_richness_species_vascular",
+  "diff_richness_genera_vascular",
+  "diff_richness_families_vascular",
+  "diff_richness_classes_vascular",
+  "betadiversity_a_species_vascular",
+  "betadiversity_a_percent_species_vascular",
+  "betadiversity_Bsim_species_vascular",
+  "betadiversity_R_species_vascular",
+  "betadiversity_R_percent_species_vascular"
+)] %>% 
+  scale() %>% 
+  as.data.frame()
+
+ggcorrplot(
+  cor(temp.df), 
+  hc.order = TRUE, 
+  type = "lower",
+   lab = TRUE
+  )
+
+rm(temp.df)
+```
+The correlogram shows that only close taxonomic are highly correlated. No variables are removed at this stage.
+
+# Reducing the multicollinearity of the predictors
+
+The predictors in `ecoregions` and `ecoregions_pairs` are separated in several groups. Here I apply a within-group variance inflation analysis first, to reduce the number of predictors on each group, to later apply the same analysis to all the remaining predictors. 
+
+## ecoregions
+
+### neighbors variables
+
+```{r, fig.width=6, fig.height=4}
+ggcorrplot(
+  cor( ecoregions$data[, ecoregions$predictive.variables$neighbors]), 
+  hc.order = TRUE, 
+  type = "lower",
+   lab = TRUE
+  )
+```
+  
+As with `bias_x`, all `neighbors_x` variables are selected.
+
+### human variables
+
+The variable `human_conservation_assessment` is categorical, and removed right away
+
+```{r}
+ecoregions$predictive.variables$human <- ecoregions$predictive.variables$human[ecoregions$predictive.variables$human != "human_conservation_assessment"]
+
+ecoregions$predictive.variables$all <- ecoregions$predictive.variables$all[ecoregions$predictive.variables$all != "human_conservation_assessment"]
+```
+
+
+```{r, fig.width=6, fig.height=4}
+ggcorrplot(
+  cor(ecoregions$data[, ecoregions$predictive.variables$human]), 
+  hc.order = TRUE, 
+  type = "lower",
+   lab = TRUE
+  )
+```
+
+There are no pairs of highly correlated variables among the `human_x` variables. However, `human_footprint_minimum` yields zeroes mostly, while more than half of `human_footprint_maximum` is composed by the value 128. Since both variables do not seem to be informative, both are removed from `ecoregions$predictive.variables$human`
+
+```{r}
+ecoregions$predictive.variables$human <- c(
+  "human_population_density",
+  "human_population",
+  "human_footprint_average"
+  )
+```
+
+
+### climate variables
+
+```{r, fig.width=12, fig.height=6}
+p <- cor_dendrogram(training.df = ecoregions$data[, ecoregions$predictive.variables$climate])
+```
+There is a fair bit of climate variables correlated. To select a subgroup of uncorrelated variables I use the custom function `s_lower_vif()`, which iteratively removes variables using a variance inflation factor criteria while trying to keep the preference order defined by the user. In this case, aridity variables go first in the preference order, along with climate velocity, and the climate hypervolume.
+
+```{r}
+p <- s_lower_vif(
+  training.df = ecoregions$data[, ecoregions$predictive.variables$climate],
+  preference.order = c(
+    "climate_aridity_index_average",
+    "climate_aridity_index_maximum",
+    "climate_hypervolume",
+    "climate_velocity_lgm_average",
+    "climate_velocity_lgm_maximum",
+    "climate_bio1_average",
+    "climate_bio12_average"
+  )
+)
+p
+ecoregions$predictive.variables$climate <- p$vars
+```
+
+### landcover variables
+
+Several of the landcover variables have modes centered in either 0 or 100, and have to be removed.
+
+```{r, fig.width=6, fig.height=4}
+ecoregions$predictive.variables$landcover <- c(
+  "landcover_bare_percent_average",
+  "landcover_herbs_percent_average",
+  "landcover_trees_percent_average",
+  "landcover_ndvi_average"
+)
+
+ggcorrplot(
+  cor(ecoregions$data[, ecoregions$predictive.variables$landcover]), 
+  hc.order = TRUE, 
+  type = "lower",
+   lab = TRUE
+  )
+```
+
+None of the variables has enough correlation with the others to grant rejection.
+
+### topography
+
+```{r, fig.width=6, fig.height=4}
+ggcorrplot(
+  cor(ecoregions$data[, ecoregions$predictive.variables$topography]), 
+  hc.order = TRUE, 
+  type = "lower",
+   lab = TRUE
+  )
+```
+Considering these correlations, I keep `topography_elevation_average` and `topography_elevation_range`.
+
+```{r}
+ecoregions$predictive.variables$topography <- c(
+  "topography_elevation_average",
+  "topography_elevation_range"
+)
+```
+
+### fragmentation
+
+There is a large number of fragmentation variables, and to speed-up variable selection here I use `s_lower_vif()` again, but without any particular order of preference.
+
+```{r, fig.width=12, fig.height=9}
+p <- s_lower_vif(
+  training.df = ecoregions$data[, ecoregions$predictive.variables$fragmentation]
+)
+p
+ecoregions$predictive.variables$fragmentation <- p$vars
+```
+
+```{r}
+#rebuilding the vector with all predictors
+ecoregions$predictive.variables$all <- c(
+  ecoregions$predictive.variables$bias,
+  ecoregions$predictive.variables$neighbors,
+  ecoregions$predictive.variables$human,
+  ecoregions$predictive.variables$climate,
+  ecoregions$predictive.variables$landcover,
+  ecoregions$predictive.variables$topography,
+  ecoregions$predictive.variables$fragmentation
+)
+```
+
+### all
+
+I apply again `s_lower_vif()` and set the variables I need for analyses downstream first in the argument `preference.order`.
+
+
+```{r, fig.width=12, fig.height=9}
+p <- s_lower_vif(
+  training.df = ecoregions$data[, ecoregions$predictive.variables$all],
+  preference.order = c(
+    "bias_area_km2",
+    "bias_species_per_record",
+    "climate_aridity_index_average",
+    "climate_hypervolume",
+    "climate_velocity_lgm_average",
+    "neighbors_count",
+    "neighbors_percent_shared_edge",
+    "human_population_density",
+    "topography_elevation_average",
+    "topography_elevation_range",
+    "landcover_trees_percent_average",
+    "landcover_herbs_percent_average",
+    "fragmentation_cohesion",
+    "fragmentation_division"
+  )
+)
+p
+```
+Rebuilding the lists of variables in `ecoregions`.
+
+```{r}
+ecoregions$predictive.variables$bias <- p$vars[grepl("^bias", p$vars)]
+ecoregions$predictive.variables$neighbors <- p$vars[grepl("^neighbors", p$vars)]
+ecoregions$predictive.variables$human <- p$vars[grepl("^human", p$vars)]
+ecoregions$predictive.variables$climate <- p$vars[grepl("^climate", p$vars)]
+ecoregions$predictive.variables$landcover <- p$vars[grepl("^landcover", p$vars)]
+ecoregions$predictive.variables$topography <- p$vars[grepl("^topography", p$vars)]
+ecoregions$predictive.variables$fragmentation <- p$vars[grepl("^fragmentation", p$vars)]
+ecoregions$predictive.variables$autocorrelation <- NA
+ecoregions$predictive.variables$all <- p$vars
+
+rm(p)
+```
+
+
+## ecoregions_pairs
+
+### connection
+
+Most of the connection variables are categorical, nothing to do here
+
+### human
+
+```{r}
+cor(ecoregions_pairs$data[, ecoregions_pairs$predictive.variables$human]) 
+```
+
+The human variables in `ecoregions_pairs` are not highly correlated, and all them are kept.
+
+### climate
+
+```{r, fig.width=9, fig.height=6}
+ggcorrplot(
+  cor(ecoregions_pairs$data[, ecoregions_pairs$predictive.variables$climate]), 
+  hc.order = TRUE, 
+  type = "lower",
+   lab = TRUE
+  )
+```
+
+To preserve `diff_climate_aridity_index` and `diff_climate_bio_1_average` I remove `diff_climate_bio12_average` and `diff_climate_bio4_average`.
+
+```{r}
+ecoregions_pairs$predictive.variables$climate <- ecoregions_pairs$predictive.variables$climate[
+  !(ecoregions_pairs$predictive.variables$climate %in% c("diff_climate_bio12_average", "diff_climate_bio4_average"))]
+```
+
+
+### landcover
+
+```{r, fig.width=6, fig.height=4}
+ggcorrplot(
+  cor(ecoregions_pairs$data[, ecoregions_pairs$predictive.variables$landcover]), 
+  hc.order = TRUE, 
+  type = "lower",
+   lab = TRUE
+  )
+```
+
+To give preference to the variables of the MODIS Vegetation Continuous Fields product I remove `diff_landcover_ndvi_max`.
+
+```{r}
+ecoregions_pairs$predictive.variables$landcover <- ecoregions_pairs$predictive.variables$landcover[
+  !(ecoregions_pairs$predictive.variables$landcover %in% "diff_landcover_ndvi_max")]
+```
+
+### topography
+
+There is only one topographic variable, nothing to do here.
+
+### environmental overlap
+
+```{r, fig.width=6, fig.height=4}
+ggcorrplot(
+  cor(ecoregions_pairs$data[, ecoregions_pairs$predictive.variables$overlap]), 
+  hc.order = TRUE, 
+  type = "lower",
+   lab = TRUE
+  )
+```
+Since the Sorensen and Jaccard scores are linear combinations of each other, I keep Sorensen.
+
+```{r, fig.width=6, fig.height=4}
+plot(
+  ecoregions_pairs$data$environmental_overlap_jaccard, 
+  ecoregions_pairs$data$environmental_overlap_sorensen,
+  xlab = "Jaccard",
+  ylab = "Sorensen"
+  )
+```
+
+```{r}
+ecoregions_pairs$predictive.variables$overlap <- "environmental_overlap_sorensen"
+```
+
+
+### all
+
+```{r}
+#rebuilding "all"
+ecoregions_pairs$predictive.variables$all <- c(
+  ecoregions_pairs$predictive.variables$connection,
+  ecoregions_pairs$predictive.variables$human,
+  ecoregions_pairs$predictive.variables$climate,
+  ecoregions_pairs$predictive.variables$landcover,
+  ecoregions_pairs$predictive.variables$topography,
+  ecoregions_pairs$predictive.variables$overlap
+)
+```
+
+
+```{r, fig.width=12, fig.height=9}
+p <- s_lower_vif(
+  training.df = ecoregions_pairs$data[, ecoregions_pairs$predictive.variables$all],
+  preference.order = c(
+    "connection_distance",
+    "connection_shared_edge",
+    "connection_area_diff",
+    "environmental_overlap_sorensen",
+    "diff_climate_aridity_index",
+    "diff_human_population_density"
+  )
+)
+p
+
+#adding categorical variables back to p$vars
+p$vars <- c(p$vars, c(
+  "connection_same_biome",
+  "connection_same_realm",
+  "connection_same_continent",
+  "connection_are_neighbors"
+))
+```
+Rebuilding predictor groups
+
+```{r}
+ecoregions_pairs$predictive.variables$connection <- p$vars[grepl("^connection", p$vars)]
+ecoregions_pairs$predictive.variables$human <- p$vars[grepl("^diff_human", p$vars)]
+ecoregions_pairs$predictive.variables$climate <- p$vars[grepl("^diff_climate", p$vars)]
+ecoregions_pairs$predictive.variables$landcover <-p$vars [grepl("^diff_landcover", p$vars)]
+ecoregions_pairs$predictive.variables$topography <- NULL
+ecoregions_pairs$predictive.variables$overlap <- p$vars[grepl("^environmental", p$vars)]
+ecoregions_pairs$predictive.variables$all <- p$vars
+```
+
+# Betadiversity and distance matrices from ecoregions_pairs
+
+From the dataset `ecoregions_pairs` several betadiversity and distance matrices can be extracted. Here I compute the matrices of the percentage of shared taxa and Sorensen's Beta for species, genera, and families, and the matrix of geographic distances.
+
+```{r}
+#creating empty matrices
+a.s <- a.g <- a.f <- bsor.s <- bsor.g <- bsor.f <- d <- matrix(
+  data = NA,
+  nrow = nrow(ecoregions$data),
+  ncol = nrow(ecoregions$data),
+  dimnames = list(
+    rows = ecoregions$data$ecoregion_name,
+    columns = ecoregions$data$ecoregion_name
+  ))
+
+#filling matrices with data from ecoregions_pairs
+for(ecoregion.i in ecoregions$data$ecoregion_name){
+  for(ecoregion.j in ecoregions$data$ecoregion_name){
+    
+    #getting indices
+    i <- which(ecoregions$data$ecoregion_name == ecoregion.i)
+    j <- which(ecoregions$data$ecoregion_name == ecoregion.j)
+    
+    #if same index
+    if(i == j){
+      
+      #filling zero value
+      a.s[i, j] <- a.g[i, j] <- a.f[i, j] <- bsor.s[i, j] <- bsor.g[i, j] <- bsor.f[i, j] <- d[i, j] <- d[j, i] <- 0
+      
+      #jumping to next iteration
+      next
+      
+    } else {
+      
+      #index of the target row in ecoregions_pairs
+      k <- which(ecoregions_pairs$data$ecoregion_name == ecoregion.i & ecoregions_pairs$data$neighbor_name == ecoregion.j)
+      
+      #filling matrix position
+      a.s[i, j] <- a.s[j, i] <- 100 - ecoregions_pairs$data[k, "betadiversity_a_percent_species_vascular"]
+      a.g[i, j] <- a.g[j, i] <- 100 - ecoregions_pairs$data[k, "betadiversity_a_percent_genera_vascular"]
+      a.f[i, j] <- a.f[j, i] <- 100 - ecoregions_pairs$data[k, "betadiversity_a_percent_families_vascular"]
+      bsor.s[i, j] <- bsor.s[j, i] <- ecoregions_pairs$data[k, "betadiversity_Bsor_species_vascular"]
+      bsor.g[i, j] <- bsor.g[j, i] <- ecoregions_pairs$data[k, "betadiversity_Bsor_genera_vascular"]
+      bsor.f[i, j] <- bsor.f[j, i] <- ecoregions_pairs$data[k, "betadiversity_Bsor_families_vascular"]
+      d[i, j] <- d[j, i] <- ecoregions_pairs$data[k, "connection_distance"]
+
+    }
+  }
+}
+
+#saving results in ecoregions_pairs
+ecoregions_pairs$distance_a_species_vascular <- a.s
+ecoregions_pairs$distance_a_genera_vascular <- a.g
+ecoregions_pairs$distance_a_families_vascular <- a.f
+ecoregions_pairs$distance_bsor_species_vascular <- bsor.s
+ecoregions_pairs$distance_bsor_genera_vascular <- bsor.g
+ecoregions_pairs$distance_bsor_families_vascular <- bsor.f
+ecoregions_pairs$distance <- d
+
+rm(a.g, a.s, a.f, bsor.f, bsor.g, bsor.s, i, j, ecoregion.i, ecoregion.j, k)
+```
+
+
+```{r}
+save(ecoregions, ecoregions_pairs, file = "ecoregions_plant_diversity_ready.RData")
+```
+
+
+
