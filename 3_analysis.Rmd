@@ -224,23 +224,20 @@ repeat_rf.out <- repeat_rf(
 )
 ```
 
-```{r}
-pca.factors <- pca_factors(
-  distance.matrix = distance.matrix
-)
-```
-
-
 
 ```{r}
 m <- rf_spatial(
   data = training.data,
   dependent.variable.name = response,
   predictor.variable.names = predictors,
-  white.noise = TRUE,
-  autocorrelated.noise = TRUE,
   distance.matrix = distance.matrix,
+  distance.thresholds = c(0, 3000, 6000, 9000),
+  method = "rfsp",
   iterations = 10,
+  cluster.ips = c('10.42.0.1', '10.42.0.34', '10.42.0.104'),
+  cluster.cores = c(7, 4, 4),
+  cluster.user = "blas",
+  cluster.port = "11000",
   ranger.arguments = ranger.arguments
 )
 

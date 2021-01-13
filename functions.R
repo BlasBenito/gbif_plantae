@@ -1,19 +1,601 @@
-pca_factors <- function(
+add_pca_factors_optimized <- function(
+  pca.factors.df,
+  pca.factors.rank,
+  data,
+  dependent.variable.name,
+  predictor.variable.names,
+  distance.matrix,
+  distance.thresholds,
+  ranger.arguments,
+  cluster.ips = NULL,
+  cluster.cores = NULL,
+  cluster.user = NULL,
+  cluster.port = 11000
+){
+  
+  #initializing data for loop
+  rank.pca.factors.i <- pca.factors.rank
+  pca.factors.candidates.i <- pca.factors.rank$rank
+  
+  #copy of data
+  data.i <- data
+  predictor.variable.names.i <- predictor.variable.names
+  
+  #vectors to build optimization.df
+  optimization.index <- vector()
+  optimization.pca.factor.name <- vector()
+  optimization.moran.i <- vector()
+  optimization.r.squared <- vector()
+  optimization.sum <- vector()
+  i <- 0
+  
+  #iterating
+  while(length(pca.factors.candidates.i) > 0){
+    
+    i <- i + 1
+    
+    #subset pca.factors
+    last.pca.factor.name <- colnames(pca.factors.i)[ncol(pca.factors.i)]
+    pca.factors.i <- pca.factors[, pca.factors.candidates.i]
+    
+    #add the first factor to data
+    data.i <- data.frame(
+      data.i,
+      pca.factors[, pca.factors.candidates.i[1]]
+    )
+    colnames(data.i)[ncol(data.i)] <- pca.factors.candidates.i[1]
+    
+
+    #remove used column
+    if(!is.null(ncol(pca.factors.i))){
+      pca.factors.i[, pca.factors.candidates.i[1]] <- NULL
+    } else {
+      break
+    }
+    
+    #new predictor.variable.names
+    predictor.variable.names.i <- c(
+      predictor.variable.names.i, 
+      pca.factors.candidates.i[1]
+    )
+    
+    #reference moran I
+    reference.moran.i <- rank.pca.factors.i$selection.criteria[rank.pca.factors.i$selection.criteria$pca.factor.name == pca.factors.candidates.i[1], "model.moran.i"]
+    
+    #rank pca factors
+    rank.pca.factors.i <- rank_pca_factors(
+      pca.factors.df = pca.factors.i,
+      data = data.i,
+      dependent.variable.name = dependent.variable.name,
+      predictor.variable.names = predictor.variable.names.i,
+      reference.moran.i = reference.moran.i,
+      distance.matrix = distance.matrix,
+      distance.thresholds = distance.thresholds,
+      ranger.arguments = ranger.arguments.fast,
+      cluster.ips = cluster.ips,
+      cluster.cores = cluster.cores,
+      cluster.user = cluster.user,
+      cluster.port = cluster.port,
+      vif.filtering = FALSE
+    )
+    
+    #redo pca.factors.candidates.i
+    pca.factors.candidates.i <- rank.pca.factors.i$rank
+    
+    #fixing NA in last pca.factor.candidate
+    if(is.na(pca.factors.candidates.i[1])){
+      pca.factors.candidates.i[1] <- last.pca.factor.name
+    }
+    
+    #gathering data for optimization df.
+    optimization.index[i] <- i
+    optimization.pca.factor.name[i] <- pca.factors.candidates.i[1]
+    optimization.moran.i[i] <- rank.pca.factors.i$selection.criteria[1, "model.moran.i"]
+    optimization.r.squared[i] <- rank.pca.factors.i$selection.criteria[1, "model.r.squared"]
+    optimization.sum <- (1 - optimization.moran.i[i]) + optimization.r.squared[i]
+    
+  }
+  
+  optimization.df <- data.frame(
+    pca.factor.index = optimization.index,
+    pca.factor.name = optimization.pca.factor.name,
+    moran.i = optimization.moran.i,
+    r.squared = optimization.r.squared,
+    sum = (1 - optimization.moran.i) + optimization.r.squared
+  ) %>% 
+    dplyr::arrange(desc(sum))
+  
+  #get index pca factor with optimized r-squared and moran.i
+  optimized.index <- optimization.df[1, "pca.factor.index"]
+  
+  #prepare vector with best factor names
+  best.pca.factors <- optimization.df[optimization.df$pca.factor.index %in% 1:optimized.index, "pca.factor.name"]
+  
+  #output list
+  out.list <- list()
+  out.list$optimization <- optimization.df
+  out.list$best.pca.factors <- best.pca.factors
+  
+  #plot
+  x11()
+  par(mfrow = c(2, 1))
+  par(mar = c(1.5,4,2,2))
+  plot(
+    optimization.df$pca.factor.index,
+    optimization.df$r.squared,
+    xlab = "",
+    ylab = "R-squared",
+    xaxt = 'n'
+  )
+  par(mar = c(4,4,0,2))
+  plot(
+    optimization.df$pca.factor.index, 
+    optimization.df$moran.i,
+    xlab = "PCA factors added",
+    ylab = "Moran's I"
+  )
+  
+  #return output
+  out.list
+  
+}
+
+
+add_pca_factors_ordered <- function(
+  pca.factors.df,
+  pca.factors.rank,
+  data,
+  dependent.variable.name,
+  predictor.variable.names,
+  distance.matrix,
+  distance.thresholds,
+  ranger.arguments,
+  cluster.ips = NULL,
+  cluster.cores = NULL,
+  cluster.user = NULL,
+  cluster.port = 11000
+){
+  
+  #getting pca.factors.order
+  pca.factors.order <- pca.factors.rank$rank
+  
+  #importing functions from the global environment
+  rf <- get("rf", envir = .GlobalEnv)
+  root_mean_squared_error <- get("root_mean_squared_error", envir = .GlobalEnv)
+  rescale_vector <- get("rescale_vector", envir = .GlobalEnv)
+  multiscale_moran <- get("multiscale_moran", envir = .GlobalEnv)
+  moran <- get("moran", envir = .GlobalEnv)
+  
+  #preparing cluster for stand alone machine
+  if(is.null(cluster.ips) == TRUE){
+    
+    #number of available cores
+    n.cores <- parallel::detectCores() - 1
+    if(.Platform$OS.type == "windows" | !is.null(cluster.ips)){
+      temp.cluster <- parallel::makeCluster(
+        n.cores, 
+        type = "PSOCK"
+      )
+    } else {
+      temp.cluster <- parallel::makeCluster(
+        n.cores, 
+        type = "FORK"
+      )
+    }
+    
+    #preparing beowulf cluster  
+  } else {
+    
+    #preparing the cluster specification
+    cluster.spec <- cluster_spec(
+      ips = cluster.ips,
+      cores = cluster.cores,
+      user = cluster.user
+    )
+    
+    #setting parallel port
+    Sys.setenv(R_PARALLEL_PORT = cluster.port)
+    
+    #cluster setup
+    temp.cluster <- parallel::makeCluster(
+      master = cluster.ips[1], 
+      spec = cluster.spec,
+      port = Sys.getenv("R_PARALLEL_PORT"),
+      outfile = "",
+      homogeneous = TRUE
+    )
+    
+  }
+  print(temp.cluster)
+  doParallel::registerDoParallel(cl = temp.cluster)
+  
+  optimization.df <- foreach::foreach(
+    pca.factors.i = 1:length(pca.factors.order),
+    .combine = "rbind",
+    .packages = c(
+      "ranger", 
+      "magrittr", 
+      "quantable"
+    ),
+    .export = c(
+      "root_mean_squared_error", 
+      "rescale_vector",
+      "multiscale_moran",
+      "moran"
+    )
+  ) %dopar% {
+    
+    #pca factor names
+    pca.factor.selected.names.i <- pca.factors.order[1:pca.factors.i]
+    
+    #add pca factor to training data
+    data.i <- data.frame(
+      data,
+      pca.factors.df[, pca.factor.selected.names.i]
+    )
+    colnames(data.i)[(ncol(data)+1):ncol(data.i)] <- pca.factor.selected.names.i
+    
+    #new predictor.variable.names
+    predictor.variable.names.i <- c(
+      predictor.variable.names, 
+      pca.factor.selected.names.i
+    )
+    
+    #fitting model i
+    m.i <- rf(
+      data = data.i,
+      dependent.variable.name = dependent.variable.name,
+      predictor.variable.names = predictor.variable.names.i,
+      seed = pca.factors.i,
+      distance.matrix = distance.matrix,
+      distance.thresholds = distance.thresholds,
+      trees.per.variable = trees.per.variable,
+      ranger.arguments = ranger.arguments
+    )
+    
+    #output.df
+    out.df <- data.frame(
+      pca.factor.index = pca.factors.i,
+      moran.i = m.i$spatial.correlation.residuals$max.moran,
+      r.squared = m.i$r.squared,
+      sum = (1 - m.i$spatial.correlation.residuals$max.moran) + m.i$r.squared
+    )
+    
+    return(out.df)
+    
+  }
+  
+  #arranging optimization df
+  optimization.df <- dplyr::arrange(
+    optimization.df,
+    desc(sum)
+  )
+  
+  #get index pca factor with optimized r-squared and moran.i
+  optimized.index <- optimization.df[1, "pca.factor.index"]
+  
+  #prepare vector with best factor names
+  best.pca.factors <- pca.factors.order[1:optimized.index]
+  
+  #output list
+  out.list <- list()
+  out.list$optimization <- optimization.df
+  out.list$best.pca.factors <- best.pca.factors
+  
+  #plot
+  x11()
+  par(mfrow = c(2, 1))
+  par(mar = c(1.5,4,2,2))
+  plot(
+    optimization.df$pca.factor.index,
+    optimization.df$r.squared,
+    xlab = "",
+    ylab = "R-squared",
+    xaxt = 'n'
+  )
+  par(mar = c(4,4,0,2))
+  plot(
+    optimization.df$pca.factor.index, 
+    optimization.df$moran.i,
+    xlab = "PCA factors added",
+    ylab = "Moran's I"
+  )
+  
+  #return output
+  out.list
+  
+}
+
+
+# slope <- function(x, y){
+#     
+#     mx  = mean(x)
+#     my  = mean(y)
+#     sxx = sum((x - mx)*(x - mx))
+#     sxy = sum((x - mx)*(y - my))
+#     syy = sum((y - my)*(y - my))
+#     slope  = round(sxy/sxx, 3)
+#     
+#     slope
+#   
+# }
+
+
+rank_pca_factors <- function(
+  pca.factors.df,
+  data,
+  dependent.variable.name,
+  predictor.variable.names,
+  reference.moran.i,
+  distance.matrix,
+  distance.thresholds,
+  ranger.arguments,
+  cluster.ips = NULL,
+  cluster.cores = NULL,
+  cluster.user = NULL,
+  cluster.port = 11000,
+  vif.filtering = TRUE
+){
+  
+  #importing functions from the global environment
+  rf <- get("rf", envir = .GlobalEnv)
+  root_mean_squared_error <- get("root_mean_squared_error", envir = .GlobalEnv)
+  rescale_vector <- get("rescale_vector", envir = .GlobalEnv)
+  multiscale_moran <- get("multiscale_moran", envir = .GlobalEnv)
+  moran <- get("moran", envir = .GlobalEnv)
+  auto_vif <- get("auto_vif", envir = .GlobalEnv)
+  .select_by_max_vif <- get(".select_by_max_vif", envir = .GlobalEnv)
+  .select_by_preference <- get(".select_by_preference", envir = .GlobalEnv)
+  
+    #preparing cluster for stand alone machine
+    if(is.null(cluster.ips) == TRUE){
+      
+      #number of available cores
+      n.cores <- parallel::detectCores() - 1
+      if(.Platform$OS.type == "windows" | !is.null(cluster.ips)){
+        temp.cluster <- parallel::makeCluster(
+          n.cores, 
+          type = "PSOCK"
+        )
+      } else {
+        temp.cluster <- parallel::makeCluster(
+          n.cores, 
+          type = "FORK"
+        )
+      }
+      
+      #preparing beowulf cluster  
+    } else {
+      
+      #preparing the cluster specification
+      cluster.spec <- cluster_spec(
+        ips = cluster.ips,
+        cores = cluster.cores,
+        user = cluster.user
+      )
+      
+      #setting parallel port
+      Sys.setenv(R_PARALLEL_PORT = cluster.port)
+      
+      #cluster setup
+      temp.cluster <- parallel::makeCluster(
+        master = cluster.ips[1], 
+        spec = cluster.spec,
+        port = Sys.getenv("R_PARALLEL_PORT"),
+        outfile = "",
+        homogeneous = TRUE
+      )
+      
+    }
+  doParallel::registerDoParallel(cl = temp.cluster)
+  
+  #3.2.3 PREPARING PARALLELIZED LOOP TO ITERATE THROUGH distance.matrix.pca
+  pca.factor.order <- foreach::foreach(
+    pca.factors.i = 1:ncol(pca.factors.df),
+    .combine = "rbind",
+    .packages = c(
+      "ranger", 
+      "magrittr", 
+      "quantable"
+      ),
+    .export = c(
+      "root_mean_squared_error", 
+      "rescale_vector",
+      "multiscale_moran",
+      "auto_vif",
+      ".select_by_max_vif",
+      ".select_by_preference"
+      )
+  ) %dopar% {
+    
+    #3.2.3.1 preparing data
+    
+    #pca factor name
+    pca.factor.name.i <- names(pca.factors.df)[pca.factors.i]
+    
+    #training data
+    data.i <- data.frame(
+      data,
+      pca.factors.df[, pca.factors.i]
+    )
+    colnames(data.i)[ncol(data.i)] <- pca.factor.name.i
+    
+    #new predictor.variable.names
+    predictor.variable.names.i <- c(predictor.variable.names, pca.factor.name.i)
+    
+    #fitting model I
+    m.i <- rf(
+      data = data.i,
+      dependent.variable.name = dependent.variable.name,
+      predictor.variable.names = predictor.variable.names.i,
+      seed = pca.factors.i,
+      distance.matrix = distance.matrix,
+      distance.thresholds = distance.thresholds,
+      scaled.importance = FALSE,
+      ranger.arguments = ranger.arguments
+    )
+    
+    #loop output
+    out.i <- data.frame(
+      pca.factor.name = pca.factor.name.i,
+      pca.factor.moran.i = moran(
+        x = pca.factors.df[, pca.factors.i],
+        distance.matrix = distance.matrix,
+        distance.threshold = distance.thresholds[1]
+        )$moran.i,
+      model.moran.i = m.i$spatial.correlation.residuals$max.moran,
+      model.r.squared = m.i$r.squared,
+      effect.on.moran.i = reference.moran.i - m.i$spatial.correlation.residuals$max.moran,
+      interpretation = m.i$spatial.correlation.residuals$df[which.max(m.i$spatial.correlation.residuals$df$moran.i), "interpretation"]
+    )
+    
+    #returning output
+    return(out.i)
+    
+  } #end of parallelized loop
+  
+  #stopping cluster
+  parallel::stopCluster(cl = temp.cluster)
+  
+  #order dataframe
+  pca.factor.order <- pca.factor.order %>% 
+    dplyr::arrange(dplyr::desc(effect.on.moran.i))
+  
+  #selected pca.factors
+  pca.factor.order.selected <- dplyr::filter(
+      pca.factor.order,
+      effect.on.moran.i > 0,
+      pca.factor.moran.i > 0
+      )
+  
+  #apply vif filtering if requested
+  if(vif.filtering == TRUE){
+      
+    pca.factors.vif <- auto_vif(
+      x = pca.factors.df[, pca.factor.order.selected$pca.factor.name],
+      preference.order = pca.factor.order.selected$pca.factor.name,
+      verbose = FALSE
+    )
+  
+    #subset pca.factor.order
+    pca.factor.order.selected <- pca.factor.order.selected[pca.factor.order.selected$pca.factor.name %in% pca.factors.vif$vars, ]
+  
+  }
+  
+  #returns one pca factor if it is enough to reduce spatial correlation of the residuals
+  if(sum("No spatial correlation" %in% rank.pca.factors$interpretation) > 0){
+    
+    pca.factors.selected <- pca.factor.order.selected %>% 
+      dplyr::filter(interpretation == "No spatial correlation") %>% 
+      dplyr::slice(1) %>% 
+      dplyr::select(pca.factor.name) %>% 
+      .$pca.factor.name
+    
+  #returns the best candidates
+  } else {
+    
+    pca.factors.selected <- pca.factor.order.selected$pca.factor.name
+    
+  }
+  
+  #return output
+  out.list <- list()
+  out.list$selection.criteria <- pca.factor.order
+  out.list$rank <- pca.factors.selected
+  
+  #returning output list
+  out.list
+  
+}
+
+
+#generates a cluster specification for the "spec" argument of the parallel::makeCluster() function
+#ips: vector of computer ips within the local network: c('10.42.0.1', '10.42.0.34', '10.42.0.104')
+#cores: vector of integers with the number of cores available on each computer, in the same order as ips: cores = c(7, 4, 4)
+#user: character, name of the user in the different computers. Only one user name allowed.
+#returns a list that can be used directly as input for the "spec" argument of makeCluster().
+cluster_spec <- function(
+  ips,
+  cores,
+  user
+){
+  
+  #creating initial list
+  spec <- list()
+  
+  for(i in 1:length(ips)){
+    spec[[i]] <- list()
+    spec[[i]]$host <- ips[i]
+    spec[[i]]$user <- user
+    spec[[i]]$ncore <- cores[i]
+  }
+  
+  #generating nodes from the list of machines
+  spec <- lapply(
+    spec, 
+    function(spec.i) rep(
+      list(
+        list(
+          host = spec.i$host, 
+          user = spec.i$user)
+      ), 
+      spec.i$ncore
+    )
+  )
+  
+  #formating into a list of lists
+  spec <- unlist(
+    spec, 
+    recursive = FALSE
+  )
+  
+  return(spec)
+  
+}
+
+
+pca_distance_matrix <- function(
   distance.matrix = NULL,
   distance.threshold = NULL
   ){
   
-  #thresholding distance matrix 
-  if(!is.null(distance.threshold)){
-    distance.matrix[distance.matrix < distance.threshold] <- 0
+  #if distance.threshold is null, 0
+  if(is.null(distance.threshold)){
+    distance.threshold <- 0
   }
   
-  #computing pca factors
-  pca.factors <- pca(
-    distance.matrix = distance.matrix,
-    colnames.prefix = paste("distance_pca_", 1:ncol(distance.matrix), sep = ""),
-    plot = FALSE
-  )
+  #list to store pca factors
+  pca.factors.list <- list()
+  
+  #iterating through distance thresholds
+  for(distance.threshold.i in distance.threshold){
+    
+    #copy distance matrix
+    distance.matrix.i <- distance.matrix
+    
+    #applying threshold to distance matrix
+    distance.matrix.i[distance.matrix.i <= distance.threshold.i] <- distance.threshold.i
+    
+    #computing pca factors
+    pca.factors.list[[as.character(distance.threshold.i)]] <- pca(
+      distance.matrix = distance.matrix.i,
+      colnames.prefix = paste0(
+        "spatial_structure_", 
+        distance.threshold.i
+        ),
+      plot = FALSE
+    )
+    
+  }
+  
+  #removing names
+  names(pca.factors.list) <- NULL
+  
+  #to data frame
+  pca.factors <- do.call("cbind", pca.factors.list)
+  
+  #returning output
+  pca.factors
   
 }
 
@@ -70,13 +652,13 @@ moran <- function(
   
   #adding interpretation
   if(observed.moran > 0 & p.value <= 0.05){
-    interpretation <- "Positive autocorrelation"
+    interpretation <- "Positive spatial correlation"
   }
   if(observed.moran < 0 & p.value <= 0.05){
-    interpretation <- "Negative autocorrelation"
+    interpretation <- "Negative spatial correlation"
   }
   if(p.value > 0.05){
-    interpretation <- "No autocorrelation"
+    interpretation <- "No spatial correlation"
   }
   
   #preparing output
@@ -99,7 +681,14 @@ multiscale_moran <- function(
   
   #creating distance thresholds
   if(is.null(distance.thresholds) == TRUE){
-    distance.thresholds <- floor(seq(0, max(distance.matrix), length.out = 10))
+    distance.thresholds <- floor(
+      seq(
+        0, 
+        max(distance.matrix
+            ), 
+        length.out = 4
+        )
+      )
   }
   
   #create output dataframe
@@ -131,20 +720,25 @@ multiscale_moran <- function(
       x = distance.threshold,
       y = moran.i
     ) + 
+    ggplot2::geom_hline(
+      yintercept = 0, 
+      col = "red4", size = 0.5
+      ) +
     ggplot2::geom_point() + 
     ggplot2::geom_line() + 
-    ggplot2::xlab("Neighborhood distance") + 
+    ggplot2::xlab("Distance threshold") + 
     ggplot2::ylab("Moran's I") + 
     ggplot2::ggtitle("Multiscale Moran's I")
   
   #getting scale of max moran
-  neighborhood.max.moran <- out.df[which.max(out.df$moran.i), "distance.threshold"]
+  distance.threshold.max.moran <- out.df[which.max(out.df$moran.i), "distance.threshold"]
   
   #preparing output list
   out.list <- list()
   out.list$df <- out.df
   out.list$plot <- p
-  out.list$neighborhood.max.moran <- neighborhood.max.moran
+  out.list$max.moran <- max(out.df$moran.i)
+  out.list$max.moran.distance.threshold <- distance.threshold.max.moran
   
   if(plot == TRUE){print(p)}
 
@@ -153,30 +747,37 @@ multiscale_moran <- function(
 }
 
 pca <- function(
-  distance.matrix, 
+  distance.matrix = NULL, 
   colnames.prefix = "pca_factor", 
   plot = TRUE
   ){
-  x.pca <- prcomp(distance.matrix, scale. = TRUE)
+  
+  #removing columns with zero variance
+  distance.matrix <- distance.matrix[ , which(apply(distance.matrix, 2, var) != 0)]
+  
+  #computing pca of distance matrix
+  distance.matrix.pca <- prcomp(distance.matrix, scale. = TRUE)
   
   if(plot == TRUE){
-    p <- factoextra::fviz_eig(x.pca)
+    p <- factoextra::fviz_eig(distance.matrix.pca)
     print(p)
   }
 
-  x.pca.factors <- as.data.frame(x.pca$x)
-  colnames(x.pca.factors) <- paste(colnames.prefix, 1:ncol(x.pca.factors), sep = "_")
+  #getting pca factors
+  distance.matrix.pca.factors <- as.data.frame(distance.matrix.pca$x)
+  colnames(distance.matrix.pca.factors) <- paste(colnames.prefix, 1:ncol(distance.matrix.pca.factors), sep = "_")
   
   #robust scaling
-  x.pca.factors <- quantable::robustscale(
-    data = x.pca.factors,
-    dim = 2,
-    center = TRUE,
-    scale = TRUE,
-    preserveScale = FALSE
-  )$data
+  # distance.matrix.pca.factors <- quantable::robustscale(
+  #   data = distance.matrix.pca.factors,
+  #   dim = 2,
+  #   center = TRUE,
+  #   scale = TRUE,
+  #   preserveScale = FALSE
+  # )$data
   
-  return(x.pca.factors)
+  #returning output
+  distance.matrix.pca.factors
 }
 
 
@@ -234,6 +835,7 @@ repeat_rf <- function(
   dependent.variable.name = NULL,
   predictor.variable.names = NULL,
   distance.matrix = NULL,
+  distance.thresholds = NULL,
   iterations = 10,
   white.noise = FALSE,
   autocorrelated.noise = FALSE,
@@ -275,9 +877,16 @@ repeat_rf <- function(
   )
 ){
   
+  #initializes local.importance
+  if(is.null(ranger.arguments$local.importance)){
+    local.importance <- FALSE
+  } else {
+    local.importance <- ranger.arguments$local.importance
+  }
+  
   #lists to store results of the iterations
   predictions <- list()
-  variable.importance.local <- list()
+  if(local.importance == TRUE){variable.importance.local <- list()}
   variable.importance <- list()
   prediction.error <- list()
   r.squared <- list()
@@ -285,7 +894,24 @@ repeat_rf <- function(
   rmse <- list()
   nrmse <- list()
   residuals <- list()
-  residuals.moran <- list()
+  spatial.correlation.residuals <- list()
+  
+  #applying robust scaling to the data
+  data.scaled <- quantable::robustscale(
+    data = data[, c(
+      dependent.variable.name,
+      predictor.variable.names
+    )],
+    dim = 2,
+    center = TRUE,
+    scale = TRUE,
+    preserveScale = FALSE
+  )$data
+  
+  #if scaling fails, use regular scaling
+  if(sum(is.nan(data.scaled[, 1])) > 0 | sum(is.infinite(data.scaled[, 1])) > 0){
+    data.scaled <- as.data.frame(scale(data))
+  }
   
   #iterations
   for(i in 1:iterations){
@@ -299,6 +925,19 @@ repeat_rf <- function(
       dependent.variable.name = dependent.variable.name,
       predictor.variable.names = predictor.variable.names,
       distance.matrix = distance.matrix,
+      distance.thresholds = distance.thresholds,
+      white.noise = white.noise,
+      autocorrelated.noise = autocorrelated.noise,
+      trees.per.variable = trees.per.variable,
+      seed = i,
+      ranger.arguments = ranger.arguments
+    )
+    
+    m.i.scaled <- rf(
+      data = data.scaled,
+      dependent.variable.name = dependent.variable.name,
+      predictor.variable.names = predictor.variable.names,
+      distance.matrix = NULL,
       white.noise = white.noise,
       autocorrelated.noise = autocorrelated.noise,
       trees.per.variable = trees.per.variable,
@@ -308,15 +947,17 @@ repeat_rf <- function(
     
     #gathering results
     predictions[[i]] <- m.i$predictions
-    variable.importance.local[[i]] <- m.i$variable.importance.local
-    variable.importance[[i]] <- m.i$variable.importance
+    if(local.importance == TRUE){
+      variable.importance.local[[i]] <- m.i.scaled$variable.importance.local
+      }
+    variable.importance[[i]] <- m.i.scaled$variable.importance$vector
     prediction.error[[i]] <- m.i$prediction.error
     r.squared[[i]] <- m.i$r.squared
     pseudo.r.squared[[i]] <- m.i$pseudo.r.squared
     rmse[[i]] <- m.i$rmse
     nrmse[[i]] <- m.i$nrmse
     residuals[[i]] <- m.i$residuals
-    residuals.moran[[i]] <- m.i$residuals.moran
+    spatial.correlation.residuals[[i]] <- m.i$spatial.correlation.residuals
       
   }#end of iterations
   
@@ -339,61 +980,64 @@ repeat_rf <- function(
   predictions.by.iteration <- as.data.frame(do.call("cbind", predictions))
   colnames(predictions.by.iteration) <- iteration.columns
   predictions.mean <- data.frame(
-    mean = rowMeans(predictions.by.iteration),
-    sd = apply(predictions.by.iteration, 1, sd)
+    prediction_mean = rowMeans(predictions.by.iteration),
+    standard_deviation = apply(predictions.by.iteration, 1, sd)
   )
   m.curves$predictions <- NULL #to avoid warning
-  m.curves$predictions$by.iteration <- predictions.by.iteration
-  m.curves$predictions$mean <- predictions.mean
+  m.curves$predictions$df.wide <- predictions.by.iteration
+  m.curves$predictions$df <- predictions.mean
   
   #gathering variable.importance.local
-  m.curves$variable.importance.local <- apply(simplify2array(variable.importance.local), 1:2, mean)
+  if(local.importance == TRUE){
+    m.curves$variable.importance.local <- apply(simplify2array(variable.importance.local), 1:2, mean)
+  }
   
   #gathering variable.importance
-  m.curves$variable.importance.df <- NULL
+  m.curves$variable.importance <- NULL
   
-  variable.importance <- as.data.frame(do.call("cbind", variable.importance))
-  colnames(variable.importance) <- iteration.columns
-  variable.importance <- data.frame(
-    variable = rownames(variable.importance),
-    variable.importance,
+  #wide format
+  variable.importance.df.wide <- as.data.frame(do.call("cbind", variable.importance))
+  colnames(variable.importance.df.wide) <- iteration.columns
+  variable.importance.df.wide <- data.frame(
+    variable = rownames(variable.importance.df.wide),
+    variable.importance.df.wide,
     row.names = NULL
   )
   
+  #mean
   variable.importance.mean <- data.frame(
-    variable = variable.importance$variable,
-    mean = rowMeans(variable.importance[, tidyselect::all_of(iteration.columns)]),
-    sd = apply(variable.importance[, tidyselect::all_of(iteration.columns)], 1, sd),
+    variable = variable.importance.df.wide$variable,
+    importance = rowMeans(variable.importance.df.wide[, tidyselect::all_of(iteration.columns)]),
+    standard_deviation = apply(variable.importance.df.wide[, tidyselect::all_of(iteration.columns)], 1, sd),
     row.names = NULL
   ) %>% 
-    dplyr::arrange(desc(mean)) %>% 
+    dplyr::arrange(desc(importance)) %>% 
     as.data.frame()
-  
-  variable.importance.wide <- as.data.frame(t(variable.importance[, iteration.columns]))
-  colnames(variable.importance.wide) <- variable.importance$variable
-  variable.importance.wide <- variable.importance.wide[, variable.importance.mean$variable]
 
-  variable.importance.long <- tidyr::pivot_longer(
-    data = variable.importance,
+  variable.importance.df.long <- tidyr::pivot_longer(
+    data = variable.importance.df.wide,
     cols = tidyselect::all_of(iteration.columns),
     names_to = "iteration",
     values_to = "importance"
   ) %>% 
     as.data.frame()
   
-  variable.importance.plot <- ggplot2::ggplot(data = variable.importance.long) + 
-    ggplot2::aes(y = reorder(variable, importance), x = importance) + 
+  variable.importance.plot <- ggplot2::ggplot(data = variable.importance.df.long) + 
+    ggplot2::aes(y = reorder(
+      variable, 
+      importance,
+      FUN = max), 
+      x = importance
+      ) + 
     ggplot2::geom_boxplot() + 
     ggplot2::ylab("") + 
     ggplot2::xlab("Importance score") + 
     ggplot2::ggtitle(paste("Response variable: ", dependent.variable.name, sep = ""))
   
-  print(variable.importance.plot)
-  
   m.curves$variable.importance <- list()
-  m.curves$variable.importance$mean <- variable.importance.mean
-  m.curves$variable.importance$wide <- variable.importance.wide
-  m.curves$variable.importance$long <- variable.importance.long
+  m.curves$variable.importance$df <- variable.importance.mean
+  m.curves$variable.importance$df.wide <- variable.importance.df.wide
+  m.curves$variable.importance$df.long <- variable.importance.df.long
   m.curves$variable.importance$plot <- variable.importance.plot
 
   
@@ -413,16 +1057,12 @@ repeat_rf <- function(
   m.curves$nrmse <- unlist(nrmse)
   names(m.curves$nrmse) <- NULL
   
-  #gathering residuals.moran
-  for(i in 1:iterations){
-    residuals.moran[[i]]$plot <- NULL
-    residuals.moran[[i]]$neighborhood.max.moran <- NULL
-    residuals.moran[[i]] <- residuals.moran[[i]]$df
-    residuals.moran[[i]]$iteration <- i
-  }
-  residuals.moran.by.iteration <- do.call("rbind", residuals.moran)
+  #gathering spatial.correlation.residuals
+  spatial.correlation.residuals.by.iteration <- do.call("rbind", lapply(spatial.correlation.residuals, "[[", 1)) %>% 
+    dplyr::arrange(distance.threshold)
+  spatial.correlation.residuals.by.iteration$iteration <- rep(1:iterations, length(unique(spatial.correlation.residuals.by.iteration$distance.threshold)))
   
-  residuals.moran.mean <- residuals.moran.by.iteration %>% 
+  spatial.correlation.residuals.mean <- spatial.correlation.residuals.by.iteration %>% 
     dplyr::group_by(distance.threshold) %>% 
     dplyr::summarise(
       moran.i = mean(moran.i),
@@ -431,36 +1071,43 @@ repeat_rf <- function(
     ) %>% 
     as.data.frame()
   
-  p <- ggplot2::ggplot(data = residuals.moran.mean) + 
+  m.curves$spatial.correlation.residuals <- list()
+  
+  m.curves$spatial.correlation.residuals$df <- spatial.correlation.residuals.mean
+  
+  m.curves$spatial.correlation.residuals$df.long <- spatial.correlation.residuals.by.iteration
+  
+  m.curves$spatial.correlation.residuals$plot <- ggplot2::ggplot(data = spatial.correlation.residuals.by.iteration) + 
     ggplot2::aes(
       x = distance.threshold,
-      y = moran.i
+      y = moran.i,
+      group = iteration
     ) + 
-    ggplot2::geom_point() + 
-    ggplot2::geom_line() + 
-    ggplot2::xlab("Neighborhood distance") + 
+    ggplot2::geom_point(alpha = 0.5) + 
+    ggplot2::geom_line(alpha = 0.5) + 
+    ggplot2::geom_hline(yintercept = 0, color = "red4") +
+    ggplot2::xlab("Distance threshold") + 
     ggplot2::ylab("Moran's I") + 
     ggplot2::ggtitle("Multiscale Moran's I")
-    
-  m.curves$residuals.moran <- list()
-  m.curves$residuals.moran$by.iteration <- residuals.moran.by.iteration
-  m.curves$residuals.moran$mean <- residuals.moran.mean
-  m.curves$residuals.moran$plot <- p
   
+  m.curves$spatial.correlation.residuals$max.moran <-  mean(unlist(lapply(spatial.correlation.residuals, "[[", 3)))
+  
+  m.curves$spatial.correlation.residuals$max.moran.distance.threshold <- statistical_mode(unlist(lapply(spatial.correlation.residuals, "[[", 4)))
+
   #gathering residuals
   residuals <- as.data.frame(do.call("cbind", residuals))
   colnames(residuals) <- iteration.columns
   
   residuals.mean <- data.frame(
-    mean = rowMeans(residuals),
-    sd = apply(residuals, 1, sd),
+    residuals_mean = rowMeans(residuals),
+    standard_deviation = apply(residuals, 1, sd),
     row.names = NULL
   )
   
   m.curves$residuals <- NULL
-  m.curves$residuals$mean <- residuals.mean
+  m.curves$residuals$df <- residuals.mean
+  m.curves$residuals$df.long <- residuals
   m.curves$residuals$stats <- summary(residuals.mean$mean)
-  m.curves$residuals$by.iteration <- residuals
 
   #returning results list
   return(m.curves)
@@ -470,7 +1117,7 @@ repeat_rf <- function(
 
 
 #function to rescale vectors between given bounds
-rescaleVector <- function(x = rnorm(100),
+rescale_vector <- function(x = rnorm(100),
                           new.min = 0,
                           new.max = 100,
                           integer = FALSE){
@@ -514,7 +1161,9 @@ rf <- function(
   white.noise = FALSE,
   autocorrelated.noise = FALSE,
   distance.matrix = NULL,
+  distance.thresholds = NULL,
   trees.per.variable = NULL,
+  scaled.importance = TRUE,
   ranger.arguments = list(
     formula = NULL,
     mtry = NULL,
@@ -662,84 +1311,71 @@ rf <- function(
     y = y
   )
   
-  #adding white noise variable
-  if(white.noise == TRUE){
-    data$noise.white <- rnorm(nrow(data))
-  }
+  #if scaled.importance is TRUE
+  if(scaled.importance == TRUE){
   
-  #adding autocorrelated noise variable
-  if(autocorrelated.noise == TRUE){
-    data$noise.autocorrelated <- as.vector(
-      rescaleVector(
-        stats::filter(
-          rnorm(
-            nrow(data)
-          ),
-          filter = rep(1, sample(1:floor(nrow(data)/2), 1)),
-          method = "convolution",
-          circular = TRUE), 
-        new.max = 1, 
-        new.min = 0
-      )
+    #applying robust scaling to the data
+    data.scaled <- quantable::robustscale(
+      data = data,
+      dim = 2,
+      center = TRUE,
+      scale = TRUE,
+      preserveScale = FALSE
+    )$data
+    
+    #if scaling fails, use regular scaling
+    if(sum(is.nan(data.scaled[, 1])) > 0 | sum(is.infinite(data.scaled[, 1])) > 0){
+      data.scaled <- as.data.frame(scale(data))
+    }
+    
+    #ranger model for variable importance
+    m.scaled <- ranger::ranger(
+      data = data.scaled,
+      dependent.variable.name = dependent.variable.name,
+      num.trees = num.trees,
+      mtry = mtry,
+      importance = importance,
+      write.forest = write.forest,
+      probability = probability,
+      min.node.size = min.node.size,
+      max.depth = max.depth,
+      replace = replace,
+      sample.fraction = sample.fraction,
+      case.weights = case.weights,
+      class.weights = class.weights,
+      splitrule = splitrule,
+      num.random.splits = num.random.splits,
+      alpha = alpha,
+      minprop = minprop,
+      split.select.weights = split.select.weights,
+      always.split.variables = always.split.variables,
+      respect.unordered.factors = respect.unordered.factors,
+      scale.permutation.importance = FALSE,
+      local.importance = local.importance,
+      regularization.factor = regularization.factor,
+      regularization.usedepth = regularization.usedepth,
+      keep.inbag = keep.inbag,
+      inbag = inbag,
+      holdout = holdout,
+      quantreg = quantreg,
+      oob.error = oob.error,
+      num.threads = num.threads,
+      save.memory = save.memory,
+      verbose = verbose,
+      seed = seed,
+      classification = classification,
+      x = x,
+      y = y
     )
+  
+  } else {
+    
+    m.scaled <- m
+    
   }
-  
-  #applying robust scaling to the data
-  data.scaled <- quantable::robustscale(
-    data = data,
-    dim = 2,
-    center = TRUE,
-    scale = TRUE,
-    preserveScale = FALSE
-  )$data
-  
-  #if scaling fails, use regular scale
-  if(sum(is.nan(data.scaled[, 1])) > 0 | sum(is.infinite(data.scaled[, 1])) > 0){
-    data.scaled <- as.data.frame(scale(data))
-  }
-  
-  #ranger model for variable importance
-  m.scaled <- ranger::ranger(
-    data = data.scaled,
-    dependent.variable.name = dependent.variable.name,
-    num.trees = num.trees,
-    mtry = mtry,
-    importance = importance,
-    write.forest = write.forest,
-    probability = probability,
-    min.node.size = min.node.size,
-    max.depth = max.depth,
-    replace = replace,
-    sample.fraction = sample.fraction,
-    case.weights = case.weights,
-    class.weights = class.weights,
-    splitrule = splitrule,
-    num.random.splits = num.random.splits,
-    alpha = alpha,
-    minprop = minprop,
-    split.select.weights = split.select.weights,
-    always.split.variables = always.split.variables,
-    respect.unordered.factors = respect.unordered.factors,
-    scale.permutation.importance = scale.permutation.importance,
-    local.importance = local.importance,
-    regularization.factor = regularization.factor,
-    regularization.usedepth = regularization.usedepth,
-    keep.inbag = keep.inbag,
-    inbag = inbag,
-    holdout = holdout,
-    quantreg = quantreg,
-    oob.error = oob.error,
-    num.threads = num.threads,
-    save.memory = save.memory,
-    verbose = verbose,
-    seed = seed,
-    classification = classification,
-    x = x,
-    y = y
-  )
   
   #adding model arguments
-  m$ranger.arguments.arguments <- list(
+  m$ranger.arguments <- list(
     dependent.variable.name = dependent.variable.name,
     num.trees = num.trees,
     mtry = mtry,
@@ -776,12 +1412,27 @@ rf <- function(
   )
   
   #importance dataframe
-  m$variable.importance.df <- data.frame(
+  importance.vector <- m.scaled$variable.importance
+  m$variable.importance <- list()
+  m$variable.importance$vector <- importance.vector
+  m$variable.importance$df <- data.frame(
     variable = names(m.scaled$variable.importance),
     importance = m.scaled$variable.importance
   ) %>%
     tibble::remove_rownames() %>%
     dplyr::arrange(desc(importance))
+  
+  m$variable.importance$plot <- ggplot2::ggplot(data = m$variable.importance$df) + 
+    ggplot2::aes(
+      x = importance, 
+      y = reorder(
+        variable, 
+        importance, 
+        FUN = max
+      )
+    ) + 
+    ggplot2::geom_point(size = 2) + 
+    ggplot2::ylab("")
   
   #getting residuals
   
@@ -838,19 +1489,19 @@ rf <- function(
   m$residuals <- observed - predicted
   
   
-  #compute moran I of residuals if weighted.distance.matrix is provided
+  #compute moran I of residuals if distance.matrix is provided
   if(!is.null(distance.matrix)){
     
-    m$residuals.moran <- multiscale_moran(
+    m$spatial.correlation.residuals <- multiscale_moran(
       x = m$residuals,
       distance.matrix = distance.matrix,
+      distance.thresholds = distance.thresholds,
       plot = FALSE
       )
 
   }
   
   #replacing variable importance with the scaled one
-  m$variable.importance <- m.scaled$variable.importance
   m$variable.importance.local <- m.scaled$variable.importance.local
   
   return(m)
@@ -878,7 +1529,7 @@ vif <- function(x){
 #' @description Computes the correlation between all pairs of variables in a training dataset and computes a cluster through the expression \code{hclust(as.dist(abs(1 - correlation.matrix)))}. If a \code{\link{s_biserial_cor}} output is provided, the clustering is computed as \code{hclust(as.dist(abs(1 - correlation.matrix)), method = "single")}, and the algorithm selects variables automatically based on the R-squared value obtained by each variable in the biserial correlation analysis.
 #'
 #' @usage cor_dendrogram(
-#'   training.df,
+#'   x,
 #'   select.cols = NULL,
 #'   omit.cols = c("x", "y", "presence"),
 #'   max.cor = 0.75,
@@ -888,7 +1539,7 @@ vif <- function(x){
 #'   )
 #'
 #'
-#' @param training.df A data frame with a presence column with 1 indicating presence and 0 indicating background, and columns with predictor values.
+#' @param x A data frame with a presence column with 1 indicating presence and 0 indicating background, and columns with predictor values.
 #' @param select.cols Character vector, names of the columns representing predictors. If \code{NULL}, all numeric variables but \code{presence.column} are considered.
 #' @param omit.cols Character vector, variables to exclude from the analysis. Defaults to \code{c("x", "y", "presence")}.
 #' @param max.cor Numeric in the interval [0, 1], maximum Pearson correlation of the selected variables. Defaults to 0.75.
@@ -903,12 +1554,12 @@ vif <- function(x){
 #'data("virtualSpeciesPB")
 #'
 #'biserial.cor <- s_biserial_cor(
-#'  training.df = virtualSpeciesPB,
+#'  x = virtualSpeciesPB,
 #'  omit.cols = c("x", "y")
 #')
 #'
 #'selected.vars <- cor_dendrogram(
-#'  training.df = virtualSpeciesPB,
+#'  x = virtualSpeciesPB,
 #'  select.cols = NULL,
 #'  omit.cols = c("x", "y", "presence"),
 #'  max.cor = 0.75,
@@ -920,7 +1571,7 @@ vif <- function(x){
 #'
 #' @export
 cor_dendrogram <- function(
-  training.df,
+  x,
   select.cols = NULL,
   omit.cols = c("x", "y", "presence"),
   max.cor = 0.75,
@@ -933,29 +1584,29 @@ cor_dendrogram <- function(
   output.list <- list()
   
   #dropping omit.cols
-  if(sum(omit.cols %in% colnames(training.df)) == length(omit.cols)){
-    training.df <-
-      training.df %>%
+  if(sum(omit.cols %in% colnames(x)) == length(omit.cols)){
+    x <-
+      x %>%
       dplyr::select(-tidyselect::all_of(omit.cols))
   }
   
   #selecting select.cols
   if(is.null(select.cols) == FALSE){
-    if(sum(select.cols %in% colnames(training.df)) == length(select.cols)){
-      training.df <-
-        training.df %>%
+    if(sum(select.cols %in% colnames(x)) == length(select.cols)){
+      x <-
+        x %>%
         dplyr::select(tidyselect::all_of(select.cols))
     }
   }
   
   #getting numeric columns only and removing cases with NA
-  training.df <-
-    training.df[, unlist(lapply(training.df, is.numeric))] %>%
+  x <-
+    x[, unlist(lapply(x, is.numeric))] %>%
     na.omit()
   
   #computes correlation matrix
   cor.matrix <-
-    training.df %>%
+    x %>%
     cor() %>%
     as.dist() %>%
     abs()
@@ -1019,7 +1670,7 @@ cor_dendrogram <- function(
     }
     
     #prepare output
-    selected.variables <- colnames(training.df)
+    selected.variables <- colnames(x)
     
   } else {
     
@@ -1077,7 +1728,7 @@ cor_dendrogram <- function(
       
       #computes observed max cor
       observed.max.cor <-
-        training.df[, selected.variables] %>%
+        x[, selected.variables] %>%
         cor() %>%
         as.dist() %>%
         as.vector() %>%
@@ -1517,6 +2168,10 @@ betadiversity <- function(
   # C <- (b + c) / a
   
   #Sorensen similarity index
+  #there are different equations out there for this index
+  #Koleff: 2 * a / 2 * a + b + c
+  #Baselga: b + c / 2 * a + b + c
+  #here I substract it to 1 to convert it's values into dissimilarity, as in Benito et al. 2011.
   Bsor <- 1 - (2 * a / (2 * a + b + c))
   
   #Simpson's similarity index
@@ -1733,7 +2388,7 @@ ecoregion_fragmentation <- function(
 #' }
 #'
 #' @usage s_lower_vif(
-#'   training.df,
+#'   x,
 #'   select.cols = NULL,
 #'   omit.cols = c("x", "y", "presence"),
 #'   preference.order = NULL,
@@ -1741,10 +2396,10 @@ ecoregion_fragmentation <- function(
 #'   verbose = TRUE
 #' )
 #'
-#' @param training.df A training data frame. Non-numeric columns are excluded from the analysis.
+#' @param x A training data frame. Non-numeric columns are excluded from the analysis.
 #' @param select.cols Character vector, names of the columns which VIF wants to be assessed. If \code{NULL}, all numeric variables but \code{presence.column} are considered. It is recommended to use the variable order of the \code{variable} column from the data frame output of \code{\link{s_biserial_cor}}.
 #' @param omit.cols Character vector, variables to exclude from the analysis. Defaults to \code{c("x", "y", "presence")}.
-#' @param preference.order Character vector, column names of \code{training.df} in an order of selection priority desired by the user. For example, if \code{preference.order = c("bio1", "bio2", "bio3")}, the algorithm will first compute vif for all variables in \code{training.df} not included in \code{preference.order}, and remove on each step the variable with a higher vif. Then, vif is computed iteratively on the variables in \code{preference.order}, but removing always the variable with the lowest priority (instead of the variable with the higher vif). Finally, all variables resulting from both vif analyses are grouped together, and a new vif analysis is performed, removing first the variables not in \code{preference.order}. In summary, this option will try to preserve a set of variables as long as their vif values allow it. This option is incompatible with the argument \code{biserial.cor} (see below).
+#' @param preference.order Character vector, column names of \code{x} in an order of selection priority desired by the user. For example, if \code{preference.order = c("bio1", "bio2", "bio3")}, the algorithm will first compute vif for all variables in \code{x} not included in \code{preference.order}, and remove on each step the variable with a higher vif. Then, vif is computed iteratively on the variables in \code{preference.order}, but removing always the variable with the lowest priority (instead of the variable with the higher vif). Finally, all variables resulting from both vif analyses are grouped together, and a new vif analysis is performed, removing first the variables not in \code{preference.order}. In summary, this option will try to preserve a set of variables as long as their vif values allow it. This option is incompatible with the argument \code{biserial.cor} (see below).
 #' @param biserial.cor List, output of the function \code{\link{s_biserial_cor}}. Its R-squared scores are used to select variables. In fact, the column "variable" of the data frame within \code{biserial.cor} is used as input for the argument \code{preference.order} explained above. This is just a convenient way to set the priority in variable selection according to the output of \code{s_biserial_cor}.
 #' @param verbose Boolean, defaults to TRUE. Triggers messages describing what variables are being removed.
 #'
@@ -1755,11 +2410,11 @@ ecoregion_fragmentation <- function(
 #'
 #' data(virtual.species.training)
 #'
-#' #1. only training.df and omit.cols are provided
+#' #1. only x and omit.cols are provided
 #' #variables with max vif are removed on each step
 #'
 #' vif.auto.out <- s_lower_vif(
-#'   training.df = virtual.species.training
+#'   x = virtual.species.training
 #' )
 #'
 #'
@@ -1768,14 +2423,14 @@ ecoregion_fragmentation <- function(
 #' #priority established by s_biserial_cor()
 #'
 #' biserial.cor <- s_biserial_cor(
-#'   training.df = virtual.species.training,
+#'   x = virtual.species.training,
 #'   response.col = "presence",
 #'   omit.cols = c("x", "y"),
 #'   plot = FALSE
 #' )
 #'
 #' vif.auto.out <- s_lower_vif(
-#'   training.df = virtual.species.training,
+#'   x = virtual.species.training,
 #'   biserial.cor = biserial.cor
 #' )
 #'
@@ -1784,7 +2439,7 @@ ecoregion_fragmentation <- function(
 #' #the other variables are selected by removing those with max vif
 #'
 #' vif.auto.out <- s_lower_vif(
-#'   training.df = virtual.species.training,
+#'   x = virtual.species.training,
 #'   preference.order = c("bio1", "bio5", "bio6", "bio12")
 #' )
 #'
@@ -1794,7 +2449,7 @@ ecoregion_fragmentation <- function(
 #' @references Heiberger, Richard M. and Holland, Burt (2004). Statistical Analysis and Data Display: An Intermediate Course with Examples in S-Plus, R, and SAS. Springer Texts in Statistics. Springer. ISBN 0-387-40270-5.
 #' @export
 s_lower_vif <- function(
-  training.df,
+  x,
   select.cols = NULL,
   omit.cols = c("x", "y", "presence"),
   preference.order = NULL,
@@ -1803,29 +2458,29 @@ s_lower_vif <- function(
 ){
   
   #dropping omit.cols
-  if(sum(omit.cols %in% colnames(training.df)) == length(omit.cols)){
-    training.df <-
-      training.df %>%
+  if(sum(omit.cols %in% colnames(x)) == length(omit.cols)){
+    x <-
+      x %>%
       dplyr::select(-tidyselect::all_of(omit.cols))
   }
   
   #selecting select.cols
   if(is.null(select.cols) == FALSE){
-    if(sum(select.cols %in% colnames(training.df)) == length(select.cols)){
-      training.df <-
-        training.df %>%
+    if(sum(select.cols %in% colnames(x)) == length(select.cols)){
+      x <-
+        x %>%
         dplyr::select(tidyselect::all_of(select.cols))
     }
   }
   
   #getting numeric columns only and removing cases with NA
-  training.df <-
-    training.df[, unlist(lapply(training.df, is.numeric))] %>%
+  x <-
+    x[, unlist(lapply(x, is.numeric))] %>%
     na.omit()
   
   #preparing preference order if provided
   if (is.null(preference.order) == FALSE){
-    preference.order <- preference.order[preference.order %in% colnames(training.df)]
+    preference.order <- preference.order[preference.order %in% colnames(x)]
   }
   
   #message
@@ -1839,7 +2494,7 @@ s_lower_vif <- function(
       
       #OPTION 3: SELECT BY MAX VIF
       output.list <- .select_by_max_vif(
-        training.df = training.df,
+        x = x,
         verbose = verbose
       )
       
@@ -1850,13 +2505,13 @@ s_lower_vif <- function(
       #selecting by preference
       output.list.by.preference <- .select_by_preference(
         preference.order = preference.order,
-        training.df = training.df,
+        x = x,
         verbose = verbose
       )
       
       #selecting by max vif (variables not in preference.order)
       output.list.by.max.vif <- .select_by_max_vif(
-        training.df = training.df[, !(colnames(training.df) %in% preference.order)],
+        x = x[, !(colnames(x) %in% preference.order)],
         verbose = verbose
       )
       
@@ -1869,7 +2524,7 @@ s_lower_vif <- function(
       #vif by preference again
       output.list <- .select_by_preference(
         preference.order = selected.vars,
-        training.df = training.df,
+        x = x,
         verbose = verbose
       )
       
@@ -1882,7 +2537,7 @@ s_lower_vif <- function(
       #option 1: computing vif by preference
       output.list <- .select_by_preference(
         preference.order = biserial.cor$df$variable,
-        training.df = training.df,
+        x = x,
         verbose = verbose
       )
       
@@ -1907,6 +2562,74 @@ s_lower_vif <- function(
 
 
 
+auto_vif <- function(
+  x,
+  preference.order = NULL,
+  verbose = TRUE
+){
+  
+  #message
+  if(verbose == TRUE){cat("Removed variables: ")}
+    
+    #AND preference.order IS NOT PROVIDED
+    if(is.null(preference.order)){
+      
+      #OPTION 3: SELECT BY MAX VIF
+      output.list <- .select_by_max_vif(
+        x = x,
+        verbose = verbose
+      )
+      
+    } else {
+      
+      #OPTION 2: preference.order IS PROVIDED
+      
+      #getting only preference.order in colnames(x)
+      preference.order <- preference.order[preference.order %in% colnames(x)]
+      
+      #selecting by preference
+      output.list <- .select_by_preference(
+        x = x,
+        preference.order = preference.order,
+        verbose = verbose
+      )
+      
+      #if there are variables outside of preference.order
+      if(sum(preference.order %in% colnames(x)) != ncol(x)){
+      
+        #selecting by max vif (variables not in preference.order)
+        output.list.by.max.vif <- .select_by_max_vif(
+          x = x[, !(colnames(x) %in% preference.order)],
+          verbose = verbose
+        )
+        
+        #merging selected.vars
+        selected.vars <- c(
+          output.list$vars,
+          output.list.by.max.vif$vars
+        )
+        
+        #vif by preference again
+        output.list <- .select_by_preference(
+          preference.order = selected.vars,
+          x = x,
+          verbose = verbose
+        )
+      
+      }
+      
+    }
+  
+  #message
+  if(verbose == TRUE){cat("Done! \n")}
+
+  #returning output
+  output.list
+  
+}
+
+
+
 #' @export
 .vif_to_df <- function(x){
   
@@ -1925,16 +2648,16 @@ s_lower_vif <- function(
 
 
 #' @export
-.select_by_max_vif <- function(training.df, verbose){
+.select_by_max_vif <- function(x, verbose){
   
   #initializing selected vars
-  selected.vars <- colnames(training.df)
+  selected.vars <- colnames(x)
   
   #computes vif
   repeat {
     
     #computes vif
-    vif.df <- .vif_to_df(x = training.df[, selected.vars])
+    vif.df <- .vif_to_df(x = x[, selected.vars])
     
     #selects variables with vif lower than 5
     var.to.remove <-
@@ -1964,7 +2687,7 @@ s_lower_vif <- function(
   } #end of repeat
   
   #final vif.df
-  vif.df <- .vif_to_df(x = training.df[, selected.vars])
+  vif.df <- .vif_to_df(x = x[, selected.vars])
   
   #output list
   output.list <- list()
@@ -1977,10 +2700,14 @@ s_lower_vif <- function(
 
 
 #' @export
-.select_by_preference <- function(preference.order, training.df, verbose){
+.select_by_preference <- function(
+  x, 
+  preference.order, 
+  verbose
+  ){
   
-  #subsets to the variables already available in training.df
-  preference.order <- preference.order[preference.order %in% colnames(training.df)]
+  #subsets to the variables already available in x
+  preference.order <- preference.order[preference.order %in% colnames(x)]
   
   #initiating selected vars
   selected.vars <- preference.order[1]
@@ -1992,10 +2719,10 @@ s_lower_vif <- function(
     new.var <- preference.order[i]
     
     #computes vif
-    vif.df <- .vif_to_df(x = training.df[, c(selected.vars, new.var)])
+    vif.df <- .vif_to_df(x = x[, c(selected.vars, new.var)])
     
-    #if vif of new.var lower than 5, keep it
-    if(max(vif.df$vif) <= 2.5){
+    #if vif of new.var lower than 10, keep it
+    if(max(vif.df$vif) <= 10){
       
       selected.vars <- c(selected.vars, new.var)
       
@@ -2010,7 +2737,7 @@ s_lower_vif <- function(
   }
   
   #final vif.df
-  vif.df <- .vif_to_df(x = training.df[, selected.vars])
+  vif.df <- .vif_to_df(x = x[, selected.vars])
   
   #output list
   output.list <- list()
