@@ -4,6 +4,10 @@
 .Ruserdata
 data/
 logs/
+bibliography/
+old/
+plots/
+secondary_code/
 postgresql.jar
 postgresql-42.2.16.jar
 ecoregions.sql
