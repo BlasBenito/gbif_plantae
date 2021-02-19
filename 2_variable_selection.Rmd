@@ -59,6 +59,47 @@ ggplot2::theme_set(theme_bw())
 #loading data
 load("ecoregions_plant_diversity.RData")
 
+#removing columns with variance and mode zero from ecoregions
+numeric.columns <-  sapply(ecoregions, is.numeric)
+numeric.columns.var.0 <- names(
+  which(
+    round(
+      apply(
+        ecoregions[, numeric.columns], 
+        2, 
+        var
+        ), 
+      4
+      ) == 0
+    )
+  )
+numeric.columns.mode.0 <- names(
+  which(
+    apply(
+      ecoregions[, numeric.columns], 
+      2, 
+      statistical_mode
+    ) == 0
+  )
+)
+#of these, only 5 are predictors
+numeric.columns.mode.0 <- c(
+  "human_footprint_minimum",
+  "landcover_bare_percent_minimum",
+  "landcover_herbs_percent_minimum",
+  "landcover_trees_percent_minimum",
+  "topography_elevation_minimum"
+)
+#other problematic columns
+problematic.columns <- c(
+  "landcover_bare_percent_maximum",
+  "landcover_herbs_percent_maximum",
+  "landcover_ndvi_minimum"
+)
+
+#removing columns
+ecoregions <- ecoregions[, !(colnames(ecoregions) %in% c(numeric.columns.var.0, numeric.columns.mode.0, problematic.columns))]
+
 rm(list.of.packages, new.packages, package.i)
 ```
 
@@ -71,7 +112,7 @@ Here I focus on the world's ecoregions with an area equal or larger than 10.000 
 -   Columns relative to the ecoregion identification, named `ecoregion_x` describing the name, biome, realm, continent and area of the ecoregion in squared kilometers.
 -   Columns with proxies of bias in the species data of the ecoregions, named `bias_x`, with the number of records, records per area unit, number of species per record, and number of species per record per squared kilometre.
 -   Columns relative to plant species richness, named `richness_x`, with richness values for diferent taxonomic levels (from species to family) for different groups of plants (all plants, vascular plants, trees, and grasses).
--   Columns named \`rarity_x\`\` with *rarity-weighted richness* values (sum of 1 divided by the number of presences of each species present in the ecoregion, and sum of 1 divided by the number of ecoregions in which each species can be found) for different taxonomic groups (all plants, vascular plants, trees, and grasses) and different taxonomic levels (species and genus).
+-   Columns named `rarity_x` with *rarity-weighted richness* values (sum of 1 divided by the number of presences of each species present in the ecoregion, and sum of 1 divided by the number of ecoregions in which each species can be found) for different taxonomic groups (all plants, vascular plants, trees, and grasses) and different taxonomic levels (species and genus).
 -   Columns named `exclusive_x` with the number and percentage of exclusive taxa of the given ecoregion for different plant groups and taxonomic levels.
 -   Features of the ecoregion's neighbors (either direct neighbors, or other ecoregions within 100km when the ecoregion is isolated by the ocean), with columns named `neighbors_x`, containing values such as the number of neighbors, the sum of the neighbor's area, the total percentage of shared edge with those neighbors, their average aridity, and their number of species, genera, classes, and vamilies.
 -   Columns describing the impact of human activity in the ecoregion, named `human_x`, including the conservation assessment by Dinerstein et al. (2017), the human footpring (Sanders citation), and the human population (SIEDAC citation).
@@ -515,6 +556,44 @@ kableExtra::kbl(
   data.frame(`Selected predictors` = ecoregions.pairs.selected.variables$selected.variables)
 ) %>% kable_styling(latex_options = c("HOLD_position", "striped"))
 ```
+
+# Identifying variable interactions in `ecoregions`
+
+The function `spatialRF::rf_interactions()` helps to identify variable interactions of the form `x * y` that might become important later during modeling. Here I take advantage of this function to search for relevant variable interactions for each one of the response variables. To simplify the search, only the *species* taxonomic level is used.
+
+**richness_species_vascular**
+
+```{r}
+interactions <- spatialRF::rf_interactions(
+  data = ecoregions,
+  dependent.variable.name = "richness_species_vascular",
+  predictor.variable.names = ecoregions.selected.variables$selected.variables
+)
+```
+
+None of these interactions seem to be relevant.
+
+**rarity_weighted_richness_species_vascular**
+
+```{r, fig.width=9}
+interactions <- spatialRF::rf_interactions(
+  data = ecoregions,
+  dependent.variable.name = "rarity_weighted_richness_species_vascular",
+  predictor.variable.names = ecoregions.selected.variables$selected.variables
+)
+```
+
+**mean_rarity_species_vascular**
+
+**exclusive_species_vascular**
+
+**betadiversity_a_percent_species_vascular**
+
+**betadiversity_Bsor_species_vascular**
+
+**betadiversity_Bsim_species_vascular**
+
+**betadiversity_R_species_vascular**
 
 # Organizing the data in lists
 
