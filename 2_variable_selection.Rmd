@@ -558,58 +558,6 @@ kableExtra::kbl(
 ) %>% kable_styling(latex_options = c("HOLD_position", "striped"))
 ```
 
-# Identifying variable interactions in `ecoregions`
-
-The function `spatialRF::rf_interactions()` helps to identify variable interactions of the form `x * y` that might become important later during modeling. Here I take advantage of this function to search for relevant variable interactions for each one of the response variables. To simplify the search, only the *species* taxonomic level is used.
-
-**richness_species_vascular**
-
-```{r, message = FALSE, warning =}
-interactions <- spatialRF::rf_interactions(
-  data = ecoregions,
-  dependent.variable.name = "richness_species_vascular",
-  predictor.variable.names = ecoregions.selected.variables$selected.variables,
-  verbose = FALSE,
-  cluster.ips = c(
-    "10.42.0.1",
-    "10.42.0.34",
-    "10.42.0.104"
-  ),
-  cluster.cores = c(7, 4, 4)
-)
-```
-
-The suggested interaction has a negligible contribution to the model's R squared, and is therefore not included in the training data.
-
-**rarity_weighted_richness_species_vascular**
-
-```{r, fig.width=9}
-interactions <- spatialRF::rf_interactions(
-  data = ecoregions,
-  dependent.variable.name = "rarity_weighted_richness_species_vascular",
-  predictor.variable.names = ecoregions.selected.variables$selected.variables,
-  verbose = FALSE,
-  cluster.ips = c(
-    "10.42.0.1",
-    "10.42.0.34",
-    "10.42.0.104"
-  ),
-  cluster.cores = c(7, 4, 4)
-)
-```
-
-**mean_rarity_species_vascular**
-
-**exclusive_species_vascular**
-
-**betadiversity_a_percent_species_vascular**
-
-**betadiversity_Bsor_species_vascular**
-
-**betadiversity_Bsim_species_vascular**
-
-**betadiversity_R_species_vascular**
-
 # Organizing the data in lists
 
 To avoid cluttering the R environment with objects, here I organize the datasets `ecoregions` and `ecoregions_pairs` in two lists with their respective names, that also store information about the names of the response variables and predictors of each conceptual group.
