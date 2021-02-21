@@ -428,6 +428,7 @@ rm(ecoregions.pairs.response.variables)
 ```
 The correlogram shows that only close taxonomic levels are highly correlated, and therefore no variables are removed at this stage.
 
+
 # Reducing multicollinearity in the predictors
 
 ## ecoregions
@@ -563,15 +564,22 @@ The function `spatialRF::rf_interactions()` helps to identify variable interacti
 
 **richness_species_vascular**
 
-```{r}
+```{r, message = FALSE, warning =}
 interactions <- spatialRF::rf_interactions(
   data = ecoregions,
   dependent.variable.name = "richness_species_vascular",
-  predictor.variable.names = ecoregions.selected.variables$selected.variables
+  predictor.variable.names = ecoregions.selected.variables$selected.variables,
+  verbose = FALSE,
+  cluster.ips = c(
+    "10.42.0.1",
+    "10.42.0.34",
+    "10.42.0.104"
+  ),
+  cluster.cores = c(7, 4, 4)
 )
 ```
 
-None of these interactions seem to be relevant.
+The suggested interaction has a negligible contribution to the model's R squared, and is therefore not included in the training data.
 
 **rarity_weighted_richness_species_vascular**
 
@@ -579,7 +587,14 @@ None of these interactions seem to be relevant.
 interactions <- spatialRF::rf_interactions(
   data = ecoregions,
   dependent.variable.name = "rarity_weighted_richness_species_vascular",
-  predictor.variable.names = ecoregions.selected.variables$selected.variables
+  predictor.variable.names = ecoregions.selected.variables$selected.variables,
+  verbose = FALSE,
+  cluster.ips = c(
+    "10.42.0.1",
+    "10.42.0.34",
+    "10.42.0.104"
+  ),
+  cluster.cores = c(7, 4, 4)
 )
 ```
 
