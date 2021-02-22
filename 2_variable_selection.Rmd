@@ -557,6 +557,60 @@ kableExtra::kbl(
   data.frame(`Selected predictors` = ecoregions.pairs.selected.variables$selected.variables)
 ) %>% kable_styling(latex_options = c("HOLD_position", "striped"))
 ```
+# Betadiversity and distance matrices from ecoregions_pairs
+
+From the dataset `ecoregions_pairs` several betadiversity and distance matrices can be extracted. Here I compute the matrices of the percentage of shared taxa and Sorensen's Beta for species, genera, and families, and the matrix of geographic distances.
+
+```{r}
+#object to store results
+distance_matrices <- list()
+
+#variables to iterate over
+variables <- c(
+  "betadiversity_a_percent_species_vascular",
+  "betadiversity_a_percent_genera_vascular",
+  "betadiversity_a_percent_families_vascular",
+  "betadiversity_Bsor_species_vascular",
+  "betadiversity_Bsor_genera_vascular",
+  "betadiversity_Bsor_families_vascular",
+  "connection_distance"
+)
+
+#iterating over variables
+for(variable.i in variables){
+  
+  #distance
+  d.i <- reshape2::acast(
+    ecoregions_pairs,
+    ecoregion_name~neighbor_name,
+    value.var = variable.i
+  )
+  
+  #diagonal to zero
+  diag(d.i) <- 0
+  
+  #ordering like ecoregions and saving
+  distance_matrices[[variable.i]] <- d.i[ecoregions$ecoregion_name, ecoregions$ecoregion_name]
+  
+}
+
+#rounding to reduce size
+distance_matrices$betadiversity_a_percent_species_vascular <- round(distance_matrices$betadiversity_a_percent_species_vascular, 1)
+
+distance_matrices$betadiversity_a_percent_genera_vascular <- round(distance_matrices$betadiversity_a_percent_genera_vascular, 1)
+
+distance_matrices$betadiversity_a_percent_families_vascular <- round(distance_matrices$betadiversity_a_percent_families_vascular, 1)
+
+distance_matrices$betadiversity_Bsor_species_vascular <- round(distance_matrices$betadiversity_Bsor_species_vascular, 3)
+
+distance_matrices$betadiversity_Bsor_genera_vascular <- round(distance_matrices$betadiversity_Bsor_genera_vascular, 3)
+
+distance_matrices$betadiversity_Bsor_families_vascular <- round(distance_matrices$betadiversity_Bsor_families_vascular, 3)
+
+distance_matrices$connection_distance <- round(distance_matrices$connection_distance, 0)
+
+rm(d.i, variables, variable.i)
+```
 
 # Organizing the data in lists
 
@@ -593,6 +647,9 @@ ecoregions$response.variables$all <- c(
 
 #names of predictors
 ecoregions$predictor.variable.names <- ecoregions.selected.variables$selected.variables
+
+#adding distance matrix
+ecoregions$distance.matrix <- distance_matrices$connection_distance
 
 #adding centroids
 sf::st_geometry(ecoregions_centroids) <- "geom_centroids"
@@ -636,68 +693,35 @@ ecoregions_pairs$predictor.variable.names <- ecoregions.pairs.selected.variables
 rm(ecoregions_pairs.data)
 ```
 
-# Betadiversity and distance matrices from ecoregions_pairs
-
-From the dataset `ecoregions_pairs` several betadiversity and distance matrices can be extracted. Here I compute the matrices of the percentage of shared taxa and Sorensen's Beta for species, genera, and families, and the matrix of geographic distances.
+To separate arid and non-arid ecoregions I use the threshold 0.65 in the variable "climate_aridity_index_average". I select the indices in `ecoregions$data` to select the cases above and below the threshold and compose the datasets `ecoregions_arid` and `ecoregions_humid`.
 
 ```{r}
-#object to store results
-distance_matrices <- list()
+indices.arid <- which(ecoregions$data$climate_aridity_index_average >= 0.65)
+indices.humid <- which(ecoregions$data$climate_aridity_index_average < 0.65)
+```
 
-#variables to iterate over
-variables <- c(
-  "betadiversity_a_percent_species_vascular",
-  "betadiversity_a_percent_genera_vascular",
-  "betadiversity_a_percent_families_vascular",
-  "betadiversity_Bsor_species_vascular",
-  "betadiversity_Bsor_genera_vascular",
-  "betadiversity_Bsor_families_vascular",
-  "connection_distance"
-)
+From these indices I can prepare the lists `ecoregions_arid` and `ecoregions_humid` as follows.
 
-#iterating over variables
-for(variable.i in variables){
-  
-  #distance
-  d.i <- reshape2::acast(
-    ecoregions_pairs$data,
-    ecoregion_name~neighbor_name,
-    value.var = variable.i
-  )
-  
-  #diagonal to zero
-  diag(d.i) <- 0
-  
-  #ordering like ecoregions and saving
-  distance_matrices[[variable.i]] <- d.i[ecoregions$data$ecoregion_name, ecoregions$data$ecoregion_name]
-  
-}
+```{r}
+#copies of ecoregions
+ecoregions_arid <- ecoregions_humid <- ecoregions
 
-#rounding to reduce size
-distance_matrices$betadiversity_a_percent_species_vascular <- round(distance_matrices$betadiversity_a_percent_species_vascular, 1)
+#subsetting objects in ecoregions_arid
+ecoregions_arid$data <- ecoregions_arid$data[indices.arid, ]
+ecoregions_arid$distance.matrix <- ecoregions_arid$distance.matrix[indices.arid, indices.arid]
+ecoregions_arid$centroids <- ecoregions_arid$centroids[indices.arid, ]
+ecoregions_arid$polygons <- ecoregions_arid$polygons[indices.arid, ]
 
-distance_matrices$betadiversity_a_percent_genera_vascular <- round(distance_matrices$betadiversity_a_percent_genera_vascular, 1)
-
-distance_matrices$betadiversity_a_percent_families_vascular <- round(distance_matrices$betadiversity_a_percent_families_vascular, 1)
-
-distance_matrices$betadiversity_Bsor_species_vascular <- round(distance_matrices$betadiversity_Bsor_species_vascular, 3)
-
-distance_matrices$betadiversity_Bsor_genera_vascular <- round(distance_matrices$betadiversity_Bsor_genera_vascular, 3)
-
-distance_matrices$betadiversity_Bsor_families_vascular <- round(distance_matrices$betadiversity_Bsor_families_vascular, 3)
-
-distance_matrices$connection_distance <- round(distance_matrices$connection_distance, 0)
-
-rm(d.i, variables, variable.i)
+#subsetting objects in ecoregions_humid
+ecoregions_humid$data <- ecoregions_humid$data[indices.humid, ]
+ecoregions_humid$distance.matrix <- ecoregions_humid$distance.matrix[indices.humid, indices.humid]
+ecoregions_humid$centroids <- ecoregions_humid$centroids[indices.humid, ]
+ecoregions_humid$polygons <- ecoregions_humid$polygons[indices.humid, ]
 ```
 
 
 ```{r}
-save(ecoregions, ecoregions_pairs, distance_matrices, file = "ecoregions_plant_diversity_ready.RData")
-```
-
-```{r}
-
+save(ecoregions, ecoregions_arid, ecoregions_humid, ecoregions_pairs, distance_matrices, file = "ecoregions_plant_diversity_ready.RData")
 ```
 
 
